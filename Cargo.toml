@@ -1,0 +1,8 @@
+[package]
+name = "championship-soccer-editor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "World editor per Championship Soccer"
+
+[dependencies]
