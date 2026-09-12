@@ -4,8 +4,29 @@ Applicazione Rust per modificare i mondi di Championship Soccer.
 
 ## Stato attuale
 
-Scheletro eseguibile senza dipendenze esterne. Non carica e non modifica ancora
-i dati del gioco. La libreria per l'interfaccia grafica resta da scegliere.
+Prototipo grafico con egui/eframe: tab Nations, Leagues, Cups, Teams, Players
+e Transfers. La tab Leagues carica i campionati in sola lettura; le altre
+sezioni restano prototipi. Nessun file del mondo viene modificato.
+
+La finestra parte massimizzata, con dimensione di ripristino 1600 x 1000.
+Il testo usa Consolas installato su Windows, oppure il monospace incorporato
+quando il font non e disponibile. Da Impostazioni si puo regolare la dimensione
+da 14 a 32 punti (20 iniziali). La preferenza viene salvata nello storage locale
+di eframe alla chiusura e periodicamente, separatamente dai dati del gioco.
+
+Da File > Apri mondo si seleziona la cartella del gioco/pacchetto contenente
+Data/League, oppure direttamente Data o League. Sono supportate cartelle locali,
+non ancora archivi ZIP. Il selettore nativo usa rfd.
+
+Leagues offre ricerca per paese o nome del file, divisioni espandibili, squadre
+nell'ordine originale e proprieta di promozione, retrocessione e reputazione.
+Il lettore accetta UTF-8 e Windows-1252 (tramite encoding_rs). Le segnalazioni
+includono il file e, per gli errori di sintassi, la riga interessata.
+Il file internazionale e riconosciuto e riservato alla futura sezione Cups;
+i blocchi coppa nazionali sono separati dalle divisioni, senza interpretarli
+come campionati. Un errore di apertura non sostituisce il mondo gia caricato.
+
+Salva ed Esporta restano disabilitati. Transfers mostra due pannelli affiancati.
 
 ## Sviluppo
 
@@ -57,4 +78,12 @@ Quando l'applicazione sara completa, la build finale si produrra con
 - [Editing dei dati](https://championshipsoccer.net/manual/data-editing.html)
 - [Pacchetti personalizzati](https://championshipsoccer.net/manual/custom-football-worlds.html)
 
-Il prossimo micro-step previsto e il caricamento in sola lettura dei file lega.
+## Verifica del caricamento
+
+1. Avviare con `cargo run`, scegliere File > Apri mondo e selezionare la cartella
+   del gioco.
+2. In Leagues cercare Italy: devono comparire nove divisioni; Serie A contiene
+   venti squadre, con Inter, Napoli e Roma nelle prime tre posizioni.
+
+`cargo test` include test del parser e una verifica sui dati del gioco presenti
+accanto alla cartella editor; quest'ultima richiede il dataset originale corrente.
