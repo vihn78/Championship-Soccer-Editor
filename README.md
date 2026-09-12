@@ -25,7 +25,12 @@ Leagues offre ricerca per paese o nome del file, divisioni espandibili, squadre
 nell'ordine originale e proprieta di promozione, retrocessione e reputazione.
 Il lettore accetta UTF-8 e Windows-1252 (tramite encoding_rs). Le segnalazioni
 includono il file e, per gli errori di sintassi, la riga interessata.
-Il file internazionale e riconosciuto e riservato alla futura sezione Cups;
+Dal file internazionale del mondo aperto vengono letti paesi, club di riserva,
+reputazione e percorsi degli archivi nomi. In Leagues i paesi senza campionato
+compaiono in un elenco separato; per le leghe esistenti i club internazionali
+sono consultabili in un riquadro espandibile. Titolo e ricerca restano fissi.
+Non viene ancora cercato il file internazionale originale quando manca nel pacchetto.
+Le regole delle coppe internazionali restano riservate alla futura sezione Cups;
 i blocchi coppa nazionali sono separati dalle divisioni, senza interpretarli
 come campionati. Un errore di apertura non sostituisce il mondo gia caricato.
 

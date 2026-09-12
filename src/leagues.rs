@@ -22,7 +22,96 @@ pub struct World {
     pub league_directory: PathBuf,
     pub leagues: Vec<LeagueFile>,
     pub international_file: Option<PathBuf>,
+    pub international_countries: Vec<InternationalCountry>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct InternationalCountry {
+    pub name: String,
+    pub name_files: Vec<String>,
+    pub reputation: Option<u32>,
+    pub clubs: Vec<String>,
+}
+
+/// Legge esclusivamente i blocchi paese; le istruzioni delle coppe restano separate.
+fn parse_international_countries(text: &str) -> (Vec<InternationalCountry>, Vec<String>) {
+    let mut countries: Vec<InternationalCountry> = Vec::new();
+    let mut warnings = Vec::new();
+    let mut current = None;
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.starts_with(['*', ':']) {
+            current = None;
+            continue;
+        }
+        if let Some(instruction) = line.strip_prefix('!').or_else(|| line.strip_prefix('+')) {
+            let (key, value) = split_instruction(instruction);
+            if key.eq_ignore_ascii_case("AdditionalCountry") && line.starts_with('!') {
+                current = None;
+                if let Some(name) = value
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .filter(|name| !name.trim().is_empty())
+                {
+                    countries.push(InternationalCountry {
+                        name: name.trim().into(),
+                        ..Default::default()
+                    });
+                    current = Some(countries.len() - 1);
+                } else {
+                    warnings.push(format!(
+                        "riga {}: paese internazionale non valido",
+                        index + 1
+                    ));
+                }
+            } else if let Some(country_index) = current {
+                let country = &mut countries[country_index];
+                match key.to_ascii_lowercase().as_str() {
+                    "tempnames" => {
+                        let parts: Vec<_> = value.split('"').collect();
+                        if parts.len() == 5
+                            && parts[0].trim().is_empty()
+                            && parts[2].trim().is_empty()
+                            && parts[4].trim().is_empty()
+                            && !parts[1].is_empty()
+                            && !parts[3].is_empty()
+                        {
+                            country.name_files = vec![parts[1].into(), parts[3].into()];
+                        } else {
+                            warnings.push(format!(
+                                "riga {}: TempNames richiede due percorsi tra virgolette",
+                                index + 1
+                            ));
+                        }
+                    }
+                    "reputation" => match value.parse() {
+                        Ok(reputation) => country.reputation = Some(reputation),
+                        Err(_) => {
+                            warnings.push(format!("riga {}: reputazione non valida", index + 1))
+                        }
+                    },
+                    _ => warnings.push(format!(
+                        "riga {}: istruzione paese non riconosciuta ({line})",
+                        index + 1
+                    )),
+                }
+            }
+        } else if let Some(country_index) = current {
+            if line.starts_with(['$', '@', '=']) {
+                warnings.push(format!(
+                    "riga {}: istruzione paese non riconosciuta ({line})",
+                    index + 1
+                ));
+            } else {
+                countries[country_index].clubs.push(line.into());
+            }
+        }
+    }
+    (countries, warnings)
 }
 
 /// Accettiamo la cartella del gioco/pacchetto, Data oppure League.
@@ -39,6 +128,7 @@ pub fn load_world(selected: &Path) -> Result<World, String> {
         league_directory: directory,
         leagues: Vec::new(),
         international_file: None,
+        international_countries: Vec::new(),
         warnings: Vec::new(),
     };
     let mut paths = Vec::new();
@@ -65,7 +155,19 @@ pub fn load_world(selected: &Path) -> Result<World, String> {
             .file_stem()
             .is_some_and(|name| name.eq_ignore_ascii_case("International teams and tournaments"))
         {
-            world.international_file = Some(path);
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let (countries, warnings) = parse_international_countries(&decode_text(&bytes));
+                    world.international_countries = countries;
+                    world.warnings.extend(
+                        warnings
+                            .into_iter()
+                            .map(|warning| format!("{}: {warning}", path.display())),
+                    );
+                    world.international_file = Some(path);
+                }
+                Err(error) => world.warnings.push(format!("{}: {error}", path.display())),
+            }
             continue;
         }
         match std::fs::read(&path) {
@@ -304,5 +406,62 @@ mod tests {
     #[test]
     fn rejects_folder_without_leagues() {
         assert!(load_world(Path::new(env!("CARGO_MANIFEST_DIR"))).is_err());
+    }
+
+    #[test]
+    fn international_blocks_ignore_comments_and_cups_and_accept_both_reputation_prefixes() {
+        let (countries, warnings) = parse_international_countries(
+            "#! AdditionalCountry \"Ignored\"\n! AdditionalCountry \"One\"\n! TempNames \"first names.txt\" \"last names.txt\"\n+ reputation 4\nZulu\nAlpha\n! AdditionalCountry \"Two\"\n! reputation 9\nBeta\n* Cup\n+ reputation 20\n+ add 1 from \"One\"\nCup team\n",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(countries.len(), 2);
+        assert_eq!(countries[0].clubs, ["Zulu", "Alpha"]);
+        assert_eq!(
+            countries[0].name_files,
+            ["first names.txt", "last names.txt"]
+        );
+        assert_eq!(countries[0].reputation, Some(4));
+        assert_eq!(countries[1].reputation, Some(9));
+        assert_eq!(countries[1].clubs, ["Beta"]);
+    }
+
+    #[test]
+    fn invalid_country_does_not_append_clubs_to_previous_country() {
+        let (countries, warnings) = parse_international_countries(
+            "! AdditionalCountry \"Valid\"\nClub\n! AdditionalCountry Invalid\nWrong club\n",
+        );
+        assert_eq!(countries[0].clubs, ["Club"]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("riga 3"));
+    }
+
+    #[test]
+    fn san_marino_is_available_and_italian_sources_stay_separate() {
+        let world = load_world(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()).unwrap();
+        let san_marino = world
+            .international_countries
+            .iter()
+            .find(|country| country.name == "San Marino")
+            .unwrap();
+        assert_eq!(san_marino.clubs, ["Cailunge", "Domagnane", "Faetane"]);
+        assert_eq!(san_marino.reputation, Some(4));
+        assert!(
+            !world
+                .leagues
+                .iter()
+                .any(|league| league.country == "San Marino")
+        );
+        let italy = world
+            .international_countries
+            .iter()
+            .find(|country| country.name == "Italy")
+            .unwrap();
+        assert_eq!(italy.clubs[0], "AC Milun");
+        let domestic = world
+            .leagues
+            .iter()
+            .find(|league| league.country == "Italy")
+            .unwrap();
+        assert_eq!(domestic.divisions[0].teams[0], "Inter");
     }
 }

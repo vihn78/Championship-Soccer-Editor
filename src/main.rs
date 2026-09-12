@@ -36,6 +36,7 @@ struct WorldEditor {
     font_name: &'static str,
     world: Option<leagues::World>,
     selected_league: Option<usize>,
+    selected_international_country: Option<usize>,
     league_search: String,
     open_error: Option<String>,
 }
@@ -75,6 +76,7 @@ impl WorldEditor {
             font_name,
             world: None,
             selected_league: None,
+            selected_international_country: None,
             league_search: String::new(),
             open_error: None,
         };
@@ -151,6 +153,7 @@ impl WorldEditor {
                         match leagues::load_world(&path) {
                             Ok(world) => {
                                 self.selected_league = (!world.leagues.is_empty()).then_some(0);
+                                self.selected_international_country = None;
                                 self.world = Some(world);
                                 self.league_search.clear();
                                 self.open_error = None;
@@ -228,6 +231,34 @@ impl WorldEditor {
                 .clicked()
             {
                 self.selected_league = Some(index);
+                self.selected_international_country = None;
+            }
+        }
+        ui.separator();
+        ui.strong("Paesi senza campionato");
+        // Ordiniamo i riferimenti della vista, conservando gli indici e l'ordine dei dati.
+        let mut countries_alphabetically: Vec<_> =
+            world.international_countries.iter().enumerate().collect();
+        countries_alphabetically.sort_by_cached_key(|(_, country)| country.name.to_lowercase());
+        for (index, country) in countries_alphabetically {
+            if world
+                .leagues
+                .iter()
+                .any(|league| league.country.eq_ignore_ascii_case(&country.name))
+                || !country.name.to_lowercase().contains(&query)
+            {
+                continue;
+            }
+            matches += 1;
+            if ui
+                .selectable_label(
+                    self.selected_international_country == Some(index),
+                    &country.name,
+                )
+                .clicked()
+            {
+                self.selected_international_country = Some(index);
+                self.selected_league = None;
             }
         }
         if matches == 0 {
@@ -240,9 +271,6 @@ impl WorldEditor {
             ui.label("Apri la cartella del gioco o di un pacchetto da File → Apri mondo.");
             return;
         };
-        if world.international_file.is_some() {
-            ui.label("File internazionale riconosciuto: sarà gestito nella sezione Cups.");
-        }
         if !world.warnings.is_empty() {
             egui::CollapsingHeader::new(format!(
                 "Segnalazioni del mondo ({})",
@@ -253,6 +281,16 @@ impl WorldEditor {
                     ui.label(warning);
                 }
             });
+        }
+        if let Some(country) = self
+            .selected_international_country
+            .and_then(|index| world.international_countries.get(index))
+        {
+            ui.heading(&country.name);
+            ui.label("Nessun campionato presente nel mondo aperto.");
+            ui.label("Questi club saranno il punto di partenza per la nuova lega.");
+            Self::show_international_clubs(ui, country);
+            return;
         }
         let Some(league) = self
             .selected_league
@@ -267,6 +305,18 @@ impl WorldEditor {
             "{} divisioni • Sola lettura",
             league.divisions.len()
         ));
+        if let Some(country) = world
+            .international_countries
+            .iter()
+            .find(|country| country.name.eq_ignore_ascii_case(&league.country))
+        {
+            egui::CollapsingHeader::new("Club di riserva internazionali")
+                .id_salt(("international_clubs", &league.path))
+                .show(ui, |ui| {
+                    ui.label("Usati quando il campionato non è selezionato nella carriera.");
+                    Self::show_international_clubs(ui, country);
+                });
+        }
         let value = |number: Option<u32>| {
             number.map_or_else(|| "non definito".into(), |number| number.to_string())
         };
@@ -291,6 +341,20 @@ impl WorldEditor {
                     ui.label(format!("{:>2}. {}", team_index + 1, team));
                 }
             });
+        }
+    }
+
+    fn show_international_clubs(ui: &mut egui::Ui, country: &leagues::InternationalCountry) {
+        ui.label("Fonte: International teams and tournaments.txt • Sola lettura");
+        if let Some(reputation) = country.reputation {
+            ui.label(format!("Reputazione: {reputation}"));
+        }
+        for path in &country.name_files {
+            ui.label(format!("Archivio nomi: {path}"));
+        }
+        ui.label(format!("{} club", country.clubs.len()));
+        for (index, club) in country.clubs.iter().enumerate() {
+            ui.label(format!("{:>2}. {club}", index + 1));
         }
     }
 }
