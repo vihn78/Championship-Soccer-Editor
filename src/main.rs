@@ -67,7 +67,8 @@ impl WorldEditor {
             "Monospace"
         };
         context.egui_ctx.set_fonts(fonts);
-        context.egui_ctx.set_visuals(egui::Visuals::dark());
+        // Il tema del sistema non deve sostituire font o colori dell'editor.
+        context.egui_ctx.set_theme(egui::Theme::Dark);
         let editor = Self {
             selected_tab: 0,
             font_size,
@@ -82,22 +83,59 @@ impl WorldEditor {
     }
 
     fn apply_font_size(&self, context: &egui::Context) {
-        let mut style = (*context.global_style()).clone();
-        for (text_style, size) in [
-            (egui::TextStyle::Heading, self.font_size + 8.0),
-            (egui::TextStyle::Body, self.font_size),
-            (egui::TextStyle::Button, self.font_size),
-            (egui::TextStyle::Monospace, self.font_size),
-            (egui::TextStyle::Small, self.font_size - 2.0),
-        ] {
-            style
-                .text_styles
-                .insert(text_style, egui::FontId::monospace(size));
-        }
-        style.spacing.item_spacing = egui::vec2(14.0, 12.0);
-        style.spacing.button_padding = egui::vec2(14.0, 8.0);
-        style.spacing.interact_size.y = self.font_size + 16.0;
-        context.set_global_style(style);
+        context.all_styles_mut(|style| {
+            for (text_style, size) in [
+                (egui::TextStyle::Heading, self.font_size + 8.0),
+                (egui::TextStyle::Body, self.font_size),
+                (egui::TextStyle::Button, self.font_size),
+                (egui::TextStyle::Monospace, self.font_size),
+                (egui::TextStyle::Small, self.font_size - 2.0),
+            ] {
+                style
+                    .text_styles
+                    .insert(text_style, egui::FontId::monospace(size));
+            }
+            // Cambia solo il corpo del testo: margini e padding rimangono costanti.
+            style.spacing.item_spacing = egui::vec2(14.0, 8.0);
+            style.spacing.button_padding = egui::vec2(14.0, 8.0);
+            style.spacing.interact_size.y = 36.0;
+            let white = egui::Color32::from_rgb(245, 245, 245);
+            let mut visuals = egui::Visuals::dark();
+            visuals.override_text_color = Some(white);
+            visuals.panel_fill = egui::Color32::from_rgb(12, 20, 38);
+            visuals.window_fill = egui::Color32::from_rgb(17, 28, 49);
+            visuals.extreme_bg_color = egui::Color32::from_rgb(8, 15, 29);
+            visuals.faint_bg_color = egui::Color32::from_rgb(21, 34, 56);
+            visuals.selection.bg_fill = egui::Color32::from_rgb(42, 70, 110);
+            visuals.selection.stroke = egui::Stroke::new(1.0, white);
+            for (widget, fill) in [
+                (
+                    &mut visuals.widgets.noninteractive,
+                    egui::Color32::from_rgb(17, 28, 49),
+                ),
+                (
+                    &mut visuals.widgets.inactive,
+                    egui::Color32::from_rgb(24, 39, 62),
+                ),
+                (
+                    &mut visuals.widgets.hovered,
+                    egui::Color32::from_rgb(36, 57, 86),
+                ),
+                (
+                    &mut visuals.widgets.active,
+                    egui::Color32::from_rgb(42, 70, 110),
+                ),
+                (
+                    &mut visuals.widgets.open,
+                    egui::Color32::from_rgb(29, 47, 74),
+                ),
+            ] {
+                widget.bg_fill = fill;
+                widget.weak_bg_fill = fill;
+                widget.fg_stroke.color = white;
+            }
+            style.visuals = visuals;
+        });
     }
 
     fn show_menu(&mut self, ui: &mut egui::Ui) {
@@ -161,12 +199,6 @@ impl WorldEditor {
     }
 
     fn show_league_list(&mut self, ui: &mut egui::Ui) {
-        ui.add(
-            egui::TextEdit::singleline(&mut self.league_search)
-                .hint_text("Cerca paese o file…")
-                .desired_width(f32::INFINITY),
-        );
-        ui.separator();
         let Some(world) = &self.world else {
             ui.label("Usa File → Apri mondo per caricare i campionati.");
             return;
@@ -264,7 +296,8 @@ impl WorldEditor {
 }
 
 impl eframe::App for WorldEditor {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let previous_font_size = self.font_size;
         egui::Panel::top("menu").show(ui, |ui| {
             self.show_menu(ui);
             ui.separator();
@@ -304,12 +337,15 @@ impl eframe::App for WorldEditor {
                 .default_size(340.0)
                 .resizable(true)
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.heading(name);
-                        if name == "Leagues" {
-                            self.show_league_list(ui);
-                            return;
-                        }
+                    // Titolo e ricerca restano fissi: solo gli elementi scorrono.
+                    ui.heading(name);
+                    if name == "Leagues" {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.league_search)
+                                .hint_text("Cerca paese o file…")
+                                .desired_width(f32::INFINITY),
+                        );
+                    } else {
                         let mut search_placeholder = String::new();
                         ui.add_enabled(
                             false,
@@ -317,10 +353,18 @@ impl eframe::App for WorldEditor {
                                 .hint_text("Cerca…")
                                 .desired_width(f32::INFINITY),
                         );
-                        ui.separator();
-                        ui.label("Nessun elemento");
-                        ui.label("Qui comparirà l'elenco del mondo aperto.");
-                    });
+                    }
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt(("sidebar_items", name))
+                        .show(ui, |ui| {
+                            if name == "Leagues" {
+                                self.show_league_list(ui);
+                            } else {
+                                ui.label("Nessun elemento");
+                                ui.label("Qui comparirà l'elenco del mondo aperto.");
+                            }
+                        });
                 });
         }
         egui::CentralPanel::default().show(ui, |ui| {
@@ -355,6 +399,13 @@ impl eframe::App for WorldEditor {
                         self.open_error = None;
                     }
                 });
+        }
+        if self.font_size != previous_font_size {
+            // Non aspettiamo l'uscita normale: anche interrompendo cargo run la scelta resta salvata.
+            if let Some(storage) = frame.storage_mut() {
+                storage.set_string(FONT_SIZE_KEY, self.font_size.to_string());
+                storage.flush();
+            }
         }
     }
 

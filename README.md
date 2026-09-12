@@ -12,7 +12,10 @@ La finestra parte massimizzata, con dimensione di ripristino 1600 x 1000.
 Il testo usa Consolas installato su Windows, oppure il monospace incorporato
 quando il font non e disponibile. Da Impostazioni si puo regolare la dimensione
 da 14 a 32 punti (20 iniziali). La preferenza viene salvata nello storage locale
-di eframe alla chiusura e periodicamente, separatamente dai dati del gioco.
+di eframe immediatamente dopo ogni modifica, oltre che alla chiusura,
+separatamente dai dati del gioco. Il tema fisso blu notte usa testo bianco
+neutro; il monospace e i margini tra le righe rimangono coerenti cambiando
+dimensione o tema di Windows.
 
 Da File > Apri mondo si seleziona la cartella del gioco/pacchetto contenente
 Data/League, oppure direttamente Data o League. Sono supportate cartelle locali,
