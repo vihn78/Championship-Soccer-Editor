@@ -1,0 +1,1 @@
+C:\Users\vince\Desktop\ChampionshipSoccer-2026.09.04.0-windows-x64-release\editor\target\debug\championship-soccer-editor.exe: C:\Users\vince\Desktop\ChampionshipSoccer-2026.09.04.0-windows-x64-release\editor\src\main.rs
