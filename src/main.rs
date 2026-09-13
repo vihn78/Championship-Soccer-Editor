@@ -20,6 +20,8 @@ const TABS: [(&str, &str); 6] = [
     ),
     ("Transfers", "Trasferimenti tra due rose"),
 ];
+type PlayerCatalogEntry = (String, String, Option<(String, String)>);
+type SelectedCatalogPlayer = (String, String, Option<(String, String)>, std::path::PathBuf);
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -57,10 +59,12 @@ struct WorldEditor {
     team_league_search: String,
     team_search: String,
     selected_team: Option<String>,
-    #[allow(dead_code)]
     selected_player: Option<usize>,
+    player_search: String,
+    selected_catalog_player: Option<String>,
     selected_kit: usize,
     team_edits: std::collections::HashMap<std::path::PathBuf, (String, teams::TeamProfile)>,
+    player_edits: std::collections::HashMap<std::path::PathBuf, teams::PlayerProfile>,
     open_error: Option<String>,
     save_message: Option<String>,
 }
@@ -116,8 +120,11 @@ impl WorldEditor {
             team_search: String::new(),
             selected_team: None,
             selected_player: None,
+            player_search: String::new(),
+            selected_catalog_player: None,
             selected_kit: 0,
             team_edits: Default::default(),
+            player_edits: Default::default(),
             open_error: None,
             save_message: None,
         };
@@ -646,6 +653,301 @@ impl WorldEditor {
             });
     }
 
+    fn player_catalog(&self) -> Vec<PlayerCatalogEntry> {
+        let Some(world) = self.world.as_ref() else {
+            return Vec::new();
+        };
+        let Some(data_directory) = world.league_directory.parent() else {
+            return Vec::new();
+        };
+        let mut club_countries = std::collections::HashMap::new();
+        for league in &world.leagues {
+            for club in league.divisions.iter().flat_map(|division| &division.teams) {
+                club_countries.insert(club.to_lowercase(), league.country.clone());
+            }
+        }
+        for country in &world.international_countries {
+            for club in &country.clubs {
+                club_countries
+                    .entry(club.to_lowercase())
+                    .or_insert_with(|| country.name.clone());
+            }
+        }
+        let mut players: std::collections::HashMap<String, PlayerCatalogEntry> =
+            std::collections::HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(data_directory.join("Player")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
+                    && let Some(name) = path.file_stem().and_then(|name| name.to_str())
+                {
+                    players.insert(
+                        name.to_lowercase(),
+                        (name.into(), "No Nationality".into(), None),
+                    );
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(data_directory.join("Team")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(team_name) = path.file_stem().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let fallback = club_countries
+                    .get(&team_name.to_lowercase())
+                    .cloned()
+                    .unwrap_or_else(|| "No Nationality".into());
+                let profile = self
+                    .team_edits
+                    .get(&path)
+                    .map(|(_, profile)| profile.clone())
+                    .unwrap_or_else(|| teams::load_team(&path, 10));
+                for roster_entry in profile.players {
+                    let name = teams::player_file_name(&roster_entry).to_owned();
+                    let key = name.to_lowercase();
+                    let roster_position = teams::roster_position(&roster_entry);
+                    match players.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert((name, fallback.clone(), roster_position));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            if entry.get().1 == "No Nationality" {
+                                entry.get_mut().1 = fallback.clone();
+                            }
+                            if entry.get().2.is_none() {
+                                entry.get_mut().2 = roster_position;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut players: Vec<_> = players.into_values().collect();
+        players.sort_by_key(|(name, _, _)| name.to_lowercase());
+        players
+    }
+
+    fn selected_catalog_player(&self) -> Option<SelectedCatalogPlayer> {
+        let name = self.selected_catalog_player.as_ref()?;
+        let (_, fallback, roster_position) = self
+            .player_catalog()
+            .into_iter()
+            .find(|(candidate, _, _)| candidate.eq_ignore_ascii_case(name))?;
+        let data_directory = self
+            .world
+            .as_ref()?
+            .league_directory
+            .parent()?
+            .to_path_buf();
+        Some((
+            name.clone(),
+            fallback,
+            roster_position,
+            data_directory.join("Player").join(format!("{name}.txt")),
+        ))
+    }
+
+    fn player_nationalities(&self) -> Vec<String> {
+        let Some(world) = self.world.as_ref() else {
+            return vec!["No Nationality".into()];
+        };
+        let mut names: Vec<_> = world
+            .leagues
+            .iter()
+            .map(|league| league.country.clone())
+            .chain(
+                world
+                    .international_countries
+                    .iter()
+                    .map(|country| country.name.clone()),
+            )
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        names.insert(0, "No Nationality".into());
+        names
+    }
+
+    fn optional_number_field(
+        ui: &mut egui::Ui,
+        profile: &mut teams::PlayerProfile,
+        label: &str,
+        key: &str,
+        range: std::ops::RangeInclusive<u32>,
+    ) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label(label);
+            if let Some(value) = profile
+                .value(key)
+                .and_then(|value| value.parse::<u32>().ok())
+            {
+                let mut value = value;
+                if ui
+                    .add(egui::Slider::new(&mut value, range.clone()))
+                    .changed()
+                {
+                    profile.set(key, value.to_string());
+                    changed = true;
+                }
+                if ui.button("Disattiva").clicked() {
+                    profile.remove(key);
+                    changed = true;
+                }
+            } else if ui.button("Attiva").clicked() {
+                profile.set(key, range.start().to_string());
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    fn show_catalog_player_details(&mut self, ui: &mut egui::Ui) {
+        let Some((name, fallback_nationality, roster_position, path)) =
+            self.selected_catalog_player()
+        else {
+            ui.label("Seleziona un giocatore dall'elenco.");
+            return;
+        };
+        let mut profile = self
+            .player_edits
+            .get(&path)
+            .cloned()
+            .unwrap_or_else(|| teams::load_player(&path));
+        let default_year = name
+            .rsplit_once('(')
+            .and_then(|(_, value)| value.strip_suffix(')'))
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(1990);
+        ui.heading(&name);
+        let nationalities = self.player_nationalities();
+        let mut changed = false;
+        let current_nationality = profile
+            .value("nationality")
+            .unwrap_or(&fallback_nationality)
+            .to_owned();
+        ui.horizontal(|ui| {
+            country_display::flag_label(ui, &self.flags, &current_nationality, "", false);
+            ui.label("Nazionalità");
+            let mut nationality = current_nationality.clone();
+            egui::ComboBox::from_id_salt("player_nationality")
+                .selected_text(&nationality)
+                .show_ui(ui, |ui| {
+                    for option in &nationalities {
+                        ui.selectable_value(&mut nationality, option.clone(), option);
+                    }
+                });
+            if nationality != current_nationality {
+                profile.set("nationality", nationality);
+                changed = true;
+            }
+            if profile.value("nationality").is_some() && ui.button("Disattiva").clicked() {
+                profile.remove("nationality");
+                changed = true;
+            }
+        });
+        let (default_role, default_side) =
+            roster_position.unwrap_or_else(|| ("M".into(), "C".into()));
+        let position = profile
+            .value("position")
+            .unwrap_or(&format!("{default_role} {default_side}"))
+            .to_owned();
+        let mut position_fields = position.split_whitespace();
+        let mut role = position_fields.next().unwrap_or(&default_role).to_owned();
+        let mut side = position_fields.next().unwrap_or(&default_side).to_owned();
+        ui.horizontal(|ui| {
+            ui.label("Ruolo");
+            egui::ComboBox::from_id_salt("player_role")
+                .selected_text(&role)
+                .show_ui(ui, |ui| {
+                    for option in ["GK", "SW", "D", "DM", "M", "AM", "F"] {
+                        ui.selectable_value(&mut role, option.into(), option);
+                    }
+                });
+            ui.label("Lato");
+            egui::ComboBox::from_id_salt("player_side")
+                .selected_text(if side.is_empty() { "Nessuno" } else { &side })
+                .show_ui(ui, |ui| {
+                    for (value, label) in [("", "Nessuno"), ("L", "L"), ("C", "C"), ("R", "R")] {
+                        ui.selectable_value(&mut side, value.into(), label);
+                    }
+                });
+            let selected_position = if side.is_empty() {
+                role.clone()
+            } else {
+                format!("{role} {side}")
+            };
+            if selected_position != position {
+                profile.set("position", selected_position);
+                changed = true;
+            }
+            if profile.value("position").is_some() && ui.button("Disattiva").clicked() {
+                profile.remove("position");
+                changed = true;
+            }
+        });
+        for (key, label) in [
+            ("ability", "Abilità"),
+            ("reputation", "Reputazione"),
+            ("potential", "Potenziale"),
+        ] {
+            changed |= Self::optional_number_field(ui, &mut profile, label, key, 10..=250);
+        }
+        ui.separator();
+        ui.strong("Anagrafica e aspetto");
+        let mut year = profile
+            .value("yearOfBirth")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(default_year);
+        ui.horizontal(|ui| {
+            ui.label("Anno di nascita");
+            if ui
+                .add(egui::DragValue::new(&mut year).range(1900..=2100))
+                .changed()
+            {
+                profile.remove("dateOfBirth");
+                profile.set("yearOfBirth", year.to_string());
+                changed = true;
+            }
+        });
+        for (key, label, values, default) in [
+            ("skin", "Pelle", &["white", "dark", "black"][..], "white"),
+            (
+                "hair",
+                "Capelli",
+                &["blond", "lightbrown", "darkbrown", "black"][..],
+                "darkbrown",
+            ),
+        ] {
+            let mut value = profile.value(key).unwrap_or(default).to_owned();
+            ui.horizontal(|ui| {
+                ui.label(label);
+                egui::ComboBox::from_id_salt(("player_appearance", key))
+                    .selected_text(&value)
+                    .show_ui(ui, |ui| {
+                        for option in values {
+                            ui.selectable_value(&mut value, (*option).to_owned(), *option);
+                        }
+                    });
+            });
+            if profile.value(key) != Some(value.as_str()) {
+                profile.set(key, value);
+                changed = true;
+            }
+        }
+        ui.separator();
+        ui.strong("Caratteristiche");
+        for (key, label) in teams::PLAYER_SKILLS {
+            changed |= Self::optional_number_field(ui, &mut profile, label, key, 1..=20);
+        }
+        if changed {
+            self.player_edits.insert(path, profile);
+        }
+    }
+
     fn show_kit_preview(
         &self,
         ui: &mut egui::Ui,
@@ -809,6 +1111,7 @@ impl WorldEditor {
                     || !world.retained_clubs.is_empty()
                     || !world.deleted_clubs.is_empty()
                     || !self.team_edits.is_empty()
+                    || !self.player_edits.is_empty()
             }
             _ => false,
         }
@@ -853,6 +1156,14 @@ impl WorldEditor {
                 self.open_error = Some(format!(
                     "Modifiche alle leghe salvate, ma non alla divisa: {error}"
                 ));
+                return;
+            }
+        }
+        let pending_player_edits = std::mem::take(&mut self.player_edits);
+        for (path, profile) in pending_player_edits {
+            if let Err(error) = teams::save_player(&path, &profile) {
+                self.player_edits.insert(path, profile);
+                self.open_error = Some(format!("Modifiche salvate, ma non al giocatore: {error}"));
                 return;
             }
         }
@@ -1614,6 +1925,12 @@ impl eframe::App for WorldEditor {
                                 .hint_text("Cerca lega…")
                                 .desired_width(f32::INFINITY),
                         );
+                    } else if name == "Players" {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.player_search)
+                                .hint_text("Cerca giocatore…")
+                                .desired_width(f32::INFINITY),
+                        );
                     } else {
                         let mut search_placeholder = String::new();
                         ui.add_enabled(
@@ -1631,6 +1948,38 @@ impl eframe::App for WorldEditor {
                                 self.show_league_list(ui);
                             } else if name == "Teams" {
                                 self.show_team_league_list(ui);
+                            } else if name == "Players" {
+                                let query = self.player_search.to_lowercase();
+                                for (player, fallback, _) in self.player_catalog() {
+                                    if !player.to_lowercase().contains(&query) {
+                                        continue;
+                                    }
+                                    let path = self
+                                        .world
+                                        .as_ref()
+                                        .and_then(|world| world.league_directory.parent())
+                                        .map(|directory| {
+                                            directory.join("Player").join(format!("{player}.txt"))
+                                        });
+                                    let nationality = path
+                                        .as_ref()
+                                        .map(|path| teams::load_player(path))
+                                        .and_then(|profile| {
+                                            profile.value("nationality").map(str::to_owned)
+                                        })
+                                        .unwrap_or(fallback);
+                                    if country_display::flag_label(
+                                        ui,
+                                        &self.flags,
+                                        &nationality,
+                                        &player,
+                                        self.selected_catalog_player.as_deref() == Some(&player),
+                                    )
+                                    .clicked()
+                                    {
+                                        self.selected_catalog_player = Some(player);
+                                    }
+                                }
                             } else {
                                 ui.label("Nessun elemento");
                                 ui.label("Qui comparirà l'elenco del mondo aperto.");
@@ -1720,6 +2069,8 @@ impl eframe::App for WorldEditor {
                         self.show_division_editor(ui);
                     } else if name == "Teams" {
                         self.show_team_details(ui);
+                    } else if name == "Players" {
+                        self.show_catalog_player_details(ui);
                     } else if name == "Transfers" {
                         ui.columns(2, |columns| {
                             Self::show_empty_roster(&mut columns[0], "Squadra di origine");
@@ -1756,6 +2107,9 @@ impl eframe::App for WorldEditor {
                         self.team_search.clear();
                         self.selected_kit = 0;
                         self.team_edits.clear();
+                        self.player_edits.clear();
+                        self.player_search.clear();
+                        self.selected_catalog_player = None;
                         self.swap_source = None;
                         self.confirm_discard = false;
                     }

@@ -1,8 +1,32 @@
 use eframe::egui;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub const KIT_PARTS: [&str; 5] = ["shirt", "stripes", "sleeves", "shorts", "socks"];
+pub const PLAYER_SKILLS: [(&str, &str); 22] = [
+    ("speed", "Velocità"),
+    ("shotPower", "Potenza tiro"),
+    ("shotControl", "Controllo tiro"),
+    ("stamina", "Resistenza"),
+    ("dribbling", "Dribbling"),
+    ("jumping", "Elevazione"),
+    ("anticipation", "Anticipo"),
+    ("agility", "Agilità"),
+    ("tackling", "Contrasto"),
+    ("heading", "Colpo di testa"),
+    ("ballControl", "Controllo palla"),
+    ("handling", "Presa"),
+    ("reflexes", "Riflessi"),
+    ("aggression", "Aggressività"),
+    ("longShots", "Tiri da lontano"),
+    ("teamwork", "Gioco di squadra"),
+    ("offensiveness", "Propensione offensiva"),
+    ("forwardRuns", "Inserimenti"),
+    ("vision", "Visione"),
+    ("adaptability", "Adattabilità"),
+    ("loyalty", "Lealtà"),
+    ("greed", "Avidità"),
+];
 
 #[derive(Clone)]
 pub struct TeamProfile {
@@ -85,6 +109,161 @@ pub fn player_file_name(player_entry: &str) -> &str {
         .split_once(':')
         .map_or(player_entry, |(name, _)| name)
         .trim()
+}
+
+pub fn roster_position(player_entry: &str) -> Option<(String, String)> {
+    let (_, position) = player_entry.split_once(':')?;
+    let mut fields = position.split_whitespace();
+    let role = fields.next()?;
+    if !matches!(role, "GK" | "SW" | "D" | "DM" | "M" | "AM" | "F") {
+        return None;
+    }
+    let side = fields
+        .next()
+        .filter(|side| matches!(*side, "L" | "C" | "R"))
+        .unwrap_or("");
+    Some((role.into(), side.into()))
+}
+
+#[derive(Clone)]
+pub struct PlayerProfile {
+    pub source_bytes: Option<Vec<u8>>,
+    fields: BTreeMap<String, String>,
+}
+
+impl PlayerProfile {
+    pub fn empty() -> Self {
+        Self {
+            source_bytes: None,
+            fields: BTreeMap::new(),
+        }
+    }
+
+    pub fn value(&self, key: &str) -> Option<&str> {
+        canonical_player_key(key).and_then(|key| self.fields.get(key).map(String::as_str))
+    }
+
+    pub fn set(&mut self, key: &str, value: impl Into<String>) {
+        if let Some(key) = canonical_player_key(key) {
+            self.fields.insert(key.into(), value.into());
+        }
+    }
+
+    pub fn remove(&mut self, key: &str) {
+        if let Some(key) = canonical_player_key(key) {
+            self.fields.remove(key);
+        }
+    }
+}
+
+pub fn load_player(path: &Path) -> PlayerProfile {
+    let Ok(bytes) = std::fs::read(path) else {
+        return PlayerProfile::empty();
+    };
+    let mut profile = PlayerProfile {
+        source_bytes: Some(bytes.clone()),
+        ..PlayerProfile::empty()
+    };
+    for line in crate::leagues::decode_text(&bytes).lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        profile.set(key.trim(), value.trim());
+    }
+    profile
+}
+
+fn canonical_player_key(key: &str) -> Option<&'static str> {
+    let normalized: String = key
+        .chars()
+        .filter(|character| !matches!(character, ' ' | '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    match normalized.as_str() {
+        "nationality" | "nation" => Some("nationality"),
+        "ability" => Some("ability"),
+        "reputation" => Some("reputation"),
+        "potential" => Some("potential"),
+        "position" => Some("position"),
+        "yearofbirth" => Some("yearOfBirth"),
+        "dateofbirth" => Some("dateOfBirth"),
+        "skin" => Some("skin"),
+        "hair" => Some("hair"),
+        "keeping" | "handling" => Some("handling"),
+        "attackmindedness" | "offensiveness" => Some("offensiveness"),
+        "adaptation" | "adaptability" => Some("adaptability"),
+        "greediness" | "greed" => Some("greed"),
+        _ => PLAYER_SKILLS
+            .iter()
+            .find(|(field, _)| field.to_lowercase() == normalized)
+            .map(|(field, _)| *field),
+    }
+}
+
+pub fn save_player(path: &Path, profile: &PlayerProfile) -> Result<(), String> {
+    if let Some(source) = &profile.source_bytes
+        && std::fs::read(path).map_err(|error| error.to_string())? != *source
+    {
+        return Err(format!("{} è cambiato esternamente.", path.display()));
+    }
+    let source = profile
+        .source_bytes
+        .as_deref()
+        .map_or_else(String::new, crate::leagues::decode_text);
+    let newline = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut output = String::new();
+    for raw in source.split_inclusive('\n') {
+        let (body, ending) = raw.strip_suffix("\r\n").map_or_else(
+            || {
+                raw.strip_suffix('\n')
+                    .map_or((raw, ""), |body| (body, "\n"))
+            },
+            |body| (body, "\r\n"),
+        );
+        if let Some((key, _)) = body.split_once('=')
+            && let Some(key) = canonical_player_key(key.trim())
+        {
+            seen.insert(key);
+            if let Some(value) = profile.fields.get(key) {
+                output.push_str(&format!("{key} = {value}{ending}"));
+            }
+        } else {
+            output.push_str(raw);
+        }
+    }
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push_str(newline);
+    }
+    for (key, value) in &profile.fields {
+        if !seen.contains(key.as_str()) {
+            output.push_str(&format!("{key} = {value}{newline}"));
+        }
+    }
+    std::fs::create_dir_all(path.parent().ok_or("Cartella Player non disponibile.")?)
+        .map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("txt.world-editor.tmp");
+    let bytes = if profile
+        .source_bytes
+        .as_ref()
+        .is_some_and(|source| std::str::from_utf8(source).is_err())
+    {
+        let (bytes, _, errors) = encoding_rs::WINDOWS_1252.encode(&output);
+        if errors {
+            return Err(
+                "Il giocatore contiene caratteri non rappresentabili in Windows-1252.".into(),
+            );
+        }
+        bytes.into_owned()
+    } else {
+        output.into_bytes()
+    };
+    std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
 
 pub fn colour_names(path: &Path) -> Vec<String> {
@@ -316,5 +495,34 @@ mod tests {
         assert!(saved.contains("Player, One: F C"));
         assert!(saved.find("Player, Two: M C") < saved.find("Player, One: F C"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn player_profile_removes_disabled_fields_when_saved() {
+        let root = std::env::temp_dir().join("world-editor-player-save");
+        let path = root.join("Test.txt");
+        let _ = std::fs::create_dir_all(&root);
+        std::fs::write(&path, "nationality = Italy\nspeed = 18\nskin = white\n").unwrap();
+        let mut profile = load_player(&path);
+        profile.remove("speed");
+        profile.set("ability", "197");
+        save_player(&path, &profile).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("nationality = Italy"));
+        assert!(saved.contains("ability = 197"));
+        assert!(!saved.contains("speed ="));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn roster_position_separates_role_and_side() {
+        assert_eq!(
+            roster_position("Taylor, Alex (1997): AM R"),
+            Some(("AM".into(), "R".into()))
+        );
+        assert_eq!(
+            roster_position("Taylor, Alex (1997): GK"),
+            Some(("GK".into(), "".into()))
+        );
     }
 }
