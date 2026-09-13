@@ -57,6 +57,8 @@ struct WorldEditor {
     team_league_search: String,
     team_search: String,
     selected_team: Option<String>,
+    #[allow(dead_code)]
+    selected_player: Option<usize>,
     selected_kit: usize,
     team_edits: std::collections::HashMap<std::path::PathBuf, (String, teams::TeamProfile)>,
     open_error: Option<String>,
@@ -113,6 +115,7 @@ impl WorldEditor {
             team_league_search: String::new(),
             team_search: String::new(),
             selected_team: None,
+            selected_player: None,
             selected_kit: 0,
             team_edits: Default::default(),
             open_error: None,
@@ -463,13 +466,19 @@ impl WorldEditor {
             if !league.country.to_lowercase().contains(&query) {
                 continue;
             }
-            if ui
-                .selectable_label(self.selected_league == Some(index), &league.country)
-                .clicked()
+            if country_display::flag_label(
+                ui,
+                &self.flags,
+                &league.country,
+                &league.country,
+                self.selected_league == Some(index),
+            )
+            .clicked()
             {
                 self.selected_league = Some(index);
                 self.selected_international_country = None;
                 self.selected_team = None;
+                self.selected_player = None;
                 self.team_search.clear();
             }
         }
@@ -488,17 +497,20 @@ impl WorldEditor {
             if !country.name.to_lowercase().contains(&query) {
                 continue;
             }
-            if ui
-                .selectable_label(
-                    self.selected_league.is_none()
-                        && self.selected_international_country == Some(index),
-                    &country.name,
-                )
-                .clicked()
+            if country_display::flag_label(
+                ui,
+                &self.flags,
+                &country.name,
+                &country.name,
+                self.selected_league.is_none()
+                    && self.selected_international_country == Some(index),
+            )
+            .clicked()
             {
                 self.selected_league = None;
                 self.selected_international_country = Some(index);
                 self.selected_team = None;
+                self.selected_player = None;
                 self.team_search.clear();
             }
         }
@@ -541,8 +553,97 @@ impl WorldEditor {
             {
                 self.selected_team = Some(team.clone());
                 self.selected_kit = 0;
+                self.selected_player = None;
             }
         }
+    }
+
+    fn show_player_list(&mut self, ui: &mut egui::Ui) {
+        let Some(world) = self.world.as_ref() else {
+            ui.label("Apri un mondo.");
+            return;
+        };
+        let Some(team_name) = self.selected_team.clone() else {
+            ui.label("Seleziona una squadra.");
+            return;
+        };
+        let fallback_nationality = self
+            .selected_league
+            .and_then(|index| world.leagues.get(index))
+            .map(|league| league.country.clone())
+            .or_else(|| {
+                self.selected_international_country
+                    .and_then(|index| world.international_countries.get(index))
+                    .map(|country| country.name.clone())
+            })
+            .unwrap_or_default();
+        let data_directory = world
+            .league_directory
+            .parent()
+            .expect("La cartella League deve avere la cartella Data come padre");
+        let team_path = data_directory.join("Team").join(format!("{team_name}.txt"));
+        let player_directory = data_directory.join("Player");
+        let mut profile = self
+            .team_edits
+            .get(&team_path)
+            .map(|(_, profile)| profile.clone())
+            .unwrap_or_else(|| teams::load_team(&team_path, 10));
+
+        ui.horizontal(|ui| {
+            let can_move_up = self.selected_player.is_some_and(|index| index > 0);
+            if ui
+                .add_enabled(can_move_up, egui::Button::new("Sposta su"))
+                .clicked()
+            {
+                let index = self.selected_player.expect("Il pulsante è abilitato");
+                profile.players.swap(index, index - 1);
+                self.selected_player = Some(index - 1);
+                self.team_edits
+                    .insert(team_path.clone(), (team_name.clone(), profile.clone()));
+            }
+
+            let can_move_down = self
+                .selected_player
+                .is_some_and(|index| index + 1 < profile.players.len());
+            if ui
+                .add_enabled(can_move_down, egui::Button::new("Sposta giù"))
+                .clicked()
+            {
+                let index = self.selected_player.expect("Il pulsante è abilitato");
+                profile.players.swap(index, index + 1);
+                self.selected_player = Some(index + 1);
+                self.team_edits
+                    .insert(team_path.clone(), (team_name.clone(), profile.clone()));
+            }
+        });
+        ui.separator();
+        if profile.players.is_empty() {
+            ui.label("Nessun giocatore nominato nel file Team.");
+            return;
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt("team_player_list")
+            .show(ui, |ui| {
+                for (index, player_entry) in profile.players.iter().enumerate() {
+                    let player_name = teams::player_file_name(player_entry);
+                    let nationality = teams::player_nationality(
+                        &player_directory.join(format!("{player_name}.txt")),
+                        &fallback_nationality,
+                    );
+                    if country_display::flag_label(
+                        ui,
+                        &self.flags,
+                        &nationality,
+                        player_entry,
+                        self.selected_player == Some(index),
+                    )
+                    .clicked()
+                    {
+                        self.selected_player = Some(index);
+                    }
+                }
+            });
     }
 
     fn show_kit_preview(
@@ -625,7 +726,17 @@ impl WorldEditor {
                 teams::load_colours(&directory.join("Graphics").join("color_table.txt"))
             });
         ui.heading(&team);
-        ui.label(format!("Reputazione: {}", profile.reputation));
+        ui.horizontal(|ui| {
+            ui.label("Reputazione");
+            if ui
+                .add(egui::DragValue::new(&mut profile.reputation).range(1..=20))
+                .changed()
+                && let Some(path) = &path
+            {
+                self.team_edits
+                    .insert(path.clone(), (team.clone(), profile.clone()));
+            }
+        });
         ui.horizontal(|ui| {
             if ui.button("◀").clicked() {
                 self.selected_kit = self.selected_kit.checked_sub(1).unwrap_or(2);
@@ -651,7 +762,7 @@ impl WorldEditor {
                             colour_change = Some((part_index, -1isize));
                         }
                         ui.add_sized(
-                            [320.0, ui.spacing().interact_size.y],
+                            [220.0, ui.spacing().interact_size.y],
                             egui::Label::new(format!(
                                 "{part}: {}",
                                 profile.kits[self.selected_kit][part_index]
@@ -1578,6 +1689,14 @@ impl eframe::App for WorldEditor {
                     egui::ScrollArea::vertical()
                         .id_salt("team_items")
                         .show(ui, |ui| self.show_team_list(ui));
+                });
+
+            egui::Panel::right("team_players")
+                .default_size(300.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    ui.heading("Giocatori");
+                    self.show_player_list(ui);
                 });
         }
         egui::CentralPanel::default().show(ui, |ui| {
