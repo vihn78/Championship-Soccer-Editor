@@ -3,6 +3,7 @@ mod country_display;
 mod league_dialogs;
 mod league_save;
 mod leagues;
+mod teams;
 mod world_edit;
 mod world_save;
 
@@ -12,7 +13,7 @@ const TABS: [(&str, &str); 6] = [
     ("Nations", "Paesi, nazionalità e archivi dei nomi"),
     ("Leagues", "Divisioni, squadre, promozioni e retrocessioni"),
     ("Cups", "Partecipanti, turni e calendario delle coppe"),
-    ("Teams", "Club e nazionali, divise e rose"),
+    ("Teams", "Club, divise e rose"),
     (
         "Players",
         "Anagrafica, ruoli e caratteristiche dei giocatori",
@@ -55,6 +56,8 @@ struct WorldEditor {
     league_search: String,
     team_search: String,
     selected_team: Option<String>,
+    selected_kit: usize,
+    team_edits: std::collections::HashMap<std::path::PathBuf, (String, teams::TeamProfile)>,
     open_error: Option<String>,
     save_message: Option<String>,
 }
@@ -108,6 +111,8 @@ impl WorldEditor {
             league_search: String::new(),
             team_search: String::new(),
             selected_team: None,
+            selected_kit: 0,
+            team_edits: Default::default(),
             open_error: None,
             save_message: None,
         };
@@ -233,6 +238,8 @@ impl WorldEditor {
                                 self.league_search.clear();
                                 self.team_search.clear();
                                 self.selected_team = None;
+                                self.selected_kit = 0;
+                                self.team_edits.clear();
                                 self.open_error = None;
                                 self.save_message = None;
                                 self.selected_tab = 1;
@@ -454,6 +461,33 @@ impl WorldEditor {
                 .clicked()
             {
                 self.selected_league = Some(index);
+                self.selected_international_country = None;
+                self.selected_team = None;
+                self.team_search.clear();
+            }
+        }
+        ui.separator();
+        ui.strong("Paesi senza campionato");
+        let mut countries: Vec<_> = world.international_countries.iter().enumerate().collect();
+        countries.sort_by_key(|(_, country)| country.name.to_lowercase());
+        for (index, country) in countries {
+            if world
+                .leagues
+                .iter()
+                .any(|league| league.country.eq_ignore_ascii_case(&country.name))
+            {
+                continue;
+            }
+            if ui
+                .selectable_label(
+                    self.selected_league.is_none()
+                        && self.selected_international_country == Some(index),
+                    &country.name,
+                )
+                .clicked()
+            {
+                self.selected_league = None;
+                self.selected_international_country = Some(index);
                 self.selected_team = None;
                 self.team_search.clear();
             }
@@ -461,19 +495,30 @@ impl WorldEditor {
     }
 
     fn show_team_list(&mut self, ui: &mut egui::Ui) {
-        let Some(league) = self.world.as_ref().and_then(|world| {
-            self.selected_league
-                .and_then(|index| world.leagues.get(index))
-        }) else {
+        let Some(world) = &self.world else {
+            ui.label("Apri un mondo.");
+            return;
+        };
+        let teams: Vec<_> = if let Some(league) = self
+            .selected_league
+            .and_then(|index| world.leagues.get(index))
+        {
+            league
+                .divisions
+                .iter()
+                .flat_map(|division| division.teams.iter())
+                .collect()
+        } else if let Some(country) = self
+            .selected_international_country
+            .and_then(|index| world.international_countries.get(index))
+        {
+            country.clubs.iter().collect()
+        } else {
             ui.label("Seleziona una lega.");
             return;
         };
         let query = self.team_search.to_lowercase();
-        let mut teams: Vec<_> = league
-            .divisions
-            .iter()
-            .flat_map(|division| division.teams.iter())
-            .collect();
+        let mut teams = teams;
         teams.sort_by_key(|team| team.to_lowercase());
         teams.dedup();
         for team in teams {
@@ -485,43 +530,142 @@ impl WorldEditor {
                 .clicked()
             {
                 self.selected_team = Some(team.clone());
+                self.selected_kit = 0;
             }
         }
     }
 
-    fn show_kit_preview(&self, ui: &mut egui::Ui) {
+    fn show_kit_preview(
+        &self,
+        ui: &mut egui::Ui,
+        kit: &[String; 5],
+        colours: &std::collections::HashMap<String, egui::Color32>,
+    ) {
         let size = egui::vec2(360.0, 360.0);
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        for name in [
+        for (index, name) in [
             "background",
             "shirt",
             "stripes",
             "sleeves",
             "shorts",
             "socks",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             if let Some(texture) = self.kit_textures.get(name) {
                 ui.painter().image(
                     texture.id(),
                     rect,
                     egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
+                    if index == 0 {
+                        egui::Color32::WHITE
+                    } else {
+                        teams::colour_for(colours, &kit[index - 1])
+                    },
                 );
             }
         }
     }
 
-    fn show_team_details(&self, ui: &mut egui::Ui) {
-        let Some(team) = &self.selected_team else {
+    fn show_team_details(&mut self, ui: &mut egui::Ui) {
+        let Some(team) = self.selected_team.clone() else {
             ui.label("Seleziona una squadra dall'elenco.");
             return;
         };
-        ui.heading(team);
-        ui.label("Anteprima grafica provvisoria delle divise.");
+        let default_reputation = self.world.as_ref().map_or(5, |world| {
+            if let Some(league) = self
+                .selected_league
+                .and_then(|index| world.leagues.get(index))
+            {
+                league
+                    .divisions
+                    .iter()
+                    .find(|division| division.teams.iter().any(|club| club == &team))
+                    .and_then(|division| division.reputation)
+                    .unwrap_or(10)
+            } else {
+                self.selected_international_country
+                    .and_then(|index| world.international_countries.get(index))
+                    .and_then(|country| country.reputation)
+                    .unwrap_or(5)
+            }
+        });
+        let data_directory = self
+            .world
+            .as_ref()
+            .and_then(|world| world.league_directory.parent())
+            .map(std::path::Path::to_path_buf);
+        let path = data_directory
+            .as_ref()
+            .map(|directory| directory.join("Team").join(format!("{team}.txt")));
+        let mut profile = path.as_ref().map_or_else(
+            || teams::TeamProfile::defaults(default_reputation),
+            |path| teams::load_team(path, default_reputation),
+        );
+        if let Some(path) = &path
+            && let Some((_, edited)) = self.team_edits.get(path)
+        {
+            profile = edited.clone();
+        }
+        let colours = data_directory
+            .as_ref()
+            .map_or_else(std::collections::HashMap::new, |directory| {
+                teams::load_colours(&directory.join("Graphics").join("color_table.txt"))
+            });
+        ui.heading(&team);
+        ui.label(format!("Reputazione: {}", profile.reputation));
+        ui.label(if profile.file_exists {
+            "File Team caricato"
+        } else {
+            "Nessun file Team: divise bianche e reputazione predefinita"
+        });
+        ui.horizontal(|ui| {
+            if ui.button("◀").clicked() {
+                self.selected_kit = self.selected_kit.checked_sub(1).unwrap_or(2);
+            }
+            ui.heading(["Home", "Away", "Third"][self.selected_kit]);
+            if ui.button("▶").clicked() {
+                self.selected_kit = (self.selected_kit + 1) % 3;
+            }
+        });
+        let palette = data_directory.as_ref().map_or_else(
+            || vec!["white".into()],
+            |directory| teams::colour_names(&directory.join("Graphics").join("color_table.txt")),
+        );
+        let mut colour_change = None;
+        for (part_index, part) in teams::KIT_PARTS.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.button("◀").clicked() {
+                    colour_change = Some((part_index, -1isize));
+                }
+                ui.label(format!(
+                    "{part}: {}",
+                    profile.kits[self.selected_kit][part_index]
+                ));
+                if ui.button("▶").clicked() {
+                    colour_change = Some((part_index, 1isize));
+                }
+            });
+        }
+        if let Some((part_index, direction)) = colour_change {
+            let current = &profile.kits[self.selected_kit][part_index];
+            let index = palette
+                .iter()
+                .position(|colour| colour.eq_ignore_ascii_case(current))
+                .unwrap_or(0) as isize;
+            let next = (index + direction).rem_euclid(palette.len() as isize) as usize;
+            profile.kits[self.selected_kit][part_index] = palette[next].clone();
+            if let Some(path) = path {
+                self.team_edits
+                    .insert(path, (team.clone(), profile.clone()));
+            }
+        }
         ui.add_space(12.0);
-        self.show_kit_preview(ui);
+        self.show_kit_preview(ui, &profile.kits[self.selected_kit], &colours);
         ui.add_space(12.0);
-        ui.label("I colori, la reputazione e la rosa saranno letti dal file Team nel prossimo micro-step.");
+        ui.label("I colori vengono salvati con Salva modifiche.");
     }
 
     fn has_changes(&self) -> bool {
@@ -540,6 +684,7 @@ impl WorldEditor {
                     || world.international_countries != saved.international_countries
                     || !world.retained_clubs.is_empty()
                     || !world.deleted_clubs.is_empty()
+                    || !self.team_edits.is_empty()
             }
             _ => false,
         }
@@ -577,6 +722,16 @@ impl WorldEditor {
         }
         world_save::mark_saved(world, &changes);
         self.saved_world = Some(world.clone());
+        let pending_team_edits = std::mem::take(&mut self.team_edits);
+        for (path, (team, profile)) in pending_team_edits {
+            if let Err(error) = teams::save_team(&path, &team, &profile) {
+                self.team_edits.insert(path, (team, profile));
+                self.open_error = Some(format!(
+                    "Modifiche alle leghe salvate, ma non alla divisa: {error}"
+                ));
+                return;
+            }
+        }
         self.open_error = None;
         self.save_message = Some(format!(
             "Salvate {} operazioni su file, senza backup automatici.",
@@ -1321,7 +1476,7 @@ impl eframe::App for WorldEditor {
         let (name, description) = TABS[self.selected_tab];
         if name != "Transfers" {
             egui::Panel::left("element_list")
-                .default_size(340.0)
+                .default_size(if name == "Teams" { 230.0 } else { 340.0 })
                 .resizable(true)
                 .show(ui, |ui| {
                     // Titolo e ricerca restano fissi: solo gli elementi scorrono.
@@ -1471,6 +1626,8 @@ impl eframe::App for WorldEditor {
                         self.selected_club = None;
                         self.selected_team = None;
                         self.team_search.clear();
+                        self.selected_kit = 0;
+                        self.team_edits.clear();
                         self.swap_source = None;
                         self.confirm_discard = false;
                     }
