@@ -26,6 +26,12 @@ pub enum Removal {
         league_index: usize,
         delete_clubs: bool,
     },
+    Club {
+        league_index: usize,
+        division_index: usize,
+        club_index: usize,
+        delete_club: bool,
+    },
 }
 
 pub struct ClubAddition {

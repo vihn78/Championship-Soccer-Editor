@@ -83,14 +83,6 @@ pub fn render(league: &LeagueFile) -> Result<Vec<u8>, String> {
                 division.name
             ));
         }
-        if league.division_sources[index].is_some_and(|source| {
-            original
-                .divisions
-                .get(source)
-                .is_none_or(|old| division.teams.len() < old.teams.len())
-        }) {
-            return Err("La rimozione di squadre non è ancora supportata nel salvataggio.".into());
-        }
         for team in &division.teams {
             if team.trim().is_empty()
                 || team.contains(['\r', '\n'])
@@ -137,6 +129,7 @@ pub fn render(league: &LeagueFile) -> Result<Vec<u8>, String> {
         };
         let trimmed = body.trim();
         let mut replacement: Option<String> = None;
+        let mut omit = false;
         let mut additions = String::new();
         let mut prefix = String::new();
         if (trimmed.starts_with(':') || trimmed.starts_with('*'))
@@ -194,15 +187,18 @@ pub fn render(league: &LeagueFile) -> Result<Vec<u8>, String> {
                     }
                 }
             } else if !trimmed.is_empty() && !trimmed.starts_with(['!', '#', ';', '$', '@', '=']) {
-                let team = league.divisions[index]
-                    .teams
-                    .get(team_index)
-                    .ok_or("Impossibile associare una riga della rosa.")?;
-                if team != trimmed {
-                    replacement = Some(team.clone());
+                if let Some(team) = league.divisions[index].teams.get(team_index) {
+                    if team != trimmed {
+                        replacement = Some(team.clone());
+                    }
+                } else {
+                    omit = true;
                 }
                 team_index += 1;
             }
+        }
+        if omit {
+            continue;
         }
         output.push_str(&prefix);
         if let Some(replacement) = replacement {
@@ -327,6 +323,18 @@ mod tests {
             league.divisions
         );
         assert!(decode_text(&rendered).ends_with("Beta\r\nGamma\r\n"));
+    }
+
+    #[test]
+    fn removes_a_club_and_keeps_the_remaining_order() {
+        let source = SOURCE.replace("Alpha\r\nBeta", "Alpha\r\nBeta\r\nGamma");
+        let mut league = parse_league(Path::new("Test.txt"), &source);
+        league.divisions[0].teams.remove(1);
+        let rendered = render(&league).unwrap();
+        assert_eq!(
+            parse_league(&league.path, &decode_text(&rendered)).divisions,
+            league.divisions
+        );
     }
 
     #[test]

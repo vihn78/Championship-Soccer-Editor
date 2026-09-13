@@ -327,6 +327,45 @@ impl World {
         }
     }
 
+    pub fn remove_club_from_division(
+        &mut self,
+        league_index: usize,
+        division_index: usize,
+        club_index: usize,
+        delete_club: bool,
+    ) -> Result<(), String> {
+        let league = self.leagues.get(league_index).ok_or("Lega non trovata")?;
+        let division = league
+            .divisions
+            .get(division_index)
+            .ok_or("Divisione non trovata")?;
+        if division.teams.len() <= 3 {
+            return Err("Una divisione deve contenere almeno 3 club.".into());
+        }
+        if division.level == Some(1)
+            && self
+                .international_countries
+                .iter()
+                .find(|country| country.name.eq_ignore_ascii_case(&league.country))
+                .is_some_and(|country| division.teams.len() <= country.clubs.len())
+        {
+            return Err(
+                "La prima divisione deve conservare almeno i club richiesti dal file internazionale."
+                    .into(),
+            );
+        }
+        let club = division
+            .teams
+            .get(club_index)
+            .cloned()
+            .ok_or("Club non trovato")?;
+        self.leagues[league_index].divisions[division_index]
+            .teams
+            .remove(club_index);
+        self.release_clubs(vec![club], delete_club);
+        Ok(())
+    }
+
     pub fn remove_division(
         &mut self,
         league_index: usize,
@@ -392,6 +431,8 @@ mod tests {
             .unwrap();
         world.add_club_to_division(index, 0, "Nuovo club").unwrap();
         assert!(world.add_club_to_division(index, 0, "Nuovo club").is_err());
+        world.remove_club_from_division(index, 0, 3, true).unwrap();
+        assert!(world.deleted_clubs.contains("Nuovo club"));
         world.leagues[index].swap_clubs((0, 0), (1, 0));
         world.sync_international(index).unwrap();
         assert_eq!(

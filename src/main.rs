@@ -37,6 +37,7 @@ fn main() -> eframe::Result {
 
 struct WorldEditor {
     flags: std::collections::HashMap<String, egui::TextureHandle>,
+    kit_textures: std::collections::HashMap<String, egui::TextureHandle>,
     selected_tab: usize,
     font_size: f32,
     font_name: &'static str,
@@ -52,6 +53,8 @@ struct WorldEditor {
     confirm_discard: bool,
     selected_international_country: Option<usize>,
     league_search: String,
+    team_search: String,
+    selected_team: Option<String>,
     open_error: Option<String>,
     save_message: Option<String>,
 }
@@ -87,6 +90,7 @@ impl WorldEditor {
         context.egui_ctx.set_theme(egui::Theme::Dark);
         let editor = Self {
             flags: country_display::load_flags(&context.egui_ctx),
+            kit_textures: Self::load_kit_textures(&context.egui_ctx),
             selected_tab: 0,
             font_size,
             font_name,
@@ -102,11 +106,46 @@ impl WorldEditor {
             confirm_discard: false,
             selected_international_country: None,
             league_search: String::new(),
+            team_search: String::new(),
+            selected_team: None,
             open_error: None,
             save_message: None,
         };
         editor.apply_font_size(&context.egui_ctx);
         editor
+    }
+
+    fn load_kit_textures(
+        context: &egui::Context,
+    ) -> std::collections::HashMap<String, egui::TextureHandle> {
+        let mut textures = std::collections::HashMap::new();
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kits");
+        for name in [
+            "background",
+            "shirt",
+            "stripes",
+            "sleeves",
+            "shorts",
+            "socks",
+        ] {
+            let path = directory.join(format!("{name}.png"));
+            if let Ok(image) = image::open(path) {
+                let rgba = image.to_rgba8();
+                let pixels = egui::ColorImage::from_rgba_unmultiplied(
+                    [rgba.width() as usize, rgba.height() as usize],
+                    rgba.as_raw(),
+                );
+                textures.insert(
+                    name.into(),
+                    context.load_texture(
+                        format!("kit_{name}"),
+                        pixels,
+                        egui::TextureOptions::LINEAR,
+                    ),
+                );
+            }
+        }
+        textures
     }
 
     fn apply_font_size(&self, context: &egui::Context) {
@@ -192,6 +231,8 @@ impl WorldEditor {
                                 self.swap_source = None;
                                 self.world = Some(world);
                                 self.league_search.clear();
+                                self.team_search.clear();
+                                self.selected_team = None;
                                 self.open_error = None;
                                 self.save_message = None;
                                 self.selected_tab = 1;
@@ -398,6 +439,89 @@ impl WorldEditor {
                     Self::show_international_clubs(ui, country, Some(league));
                 });
         }
+    }
+
+    fn show_team_league_list(&mut self, ui: &mut egui::Ui) {
+        let Some(world) = &self.world else {
+            ui.label("Usa File → Apri mondo per caricare le leghe.");
+            return;
+        };
+        let mut leagues: Vec<_> = world.leagues.iter().enumerate().collect();
+        leagues.sort_by_key(|(_, league)| league.country.to_lowercase());
+        for (index, league) in leagues {
+            if ui
+                .selectable_label(self.selected_league == Some(index), &league.country)
+                .clicked()
+            {
+                self.selected_league = Some(index);
+                self.selected_team = None;
+                self.team_search.clear();
+            }
+        }
+    }
+
+    fn show_team_list(&mut self, ui: &mut egui::Ui) {
+        let Some(league) = self.world.as_ref().and_then(|world| {
+            self.selected_league
+                .and_then(|index| world.leagues.get(index))
+        }) else {
+            ui.label("Seleziona una lega.");
+            return;
+        };
+        let query = self.team_search.to_lowercase();
+        let mut teams: Vec<_> = league
+            .divisions
+            .iter()
+            .flat_map(|division| division.teams.iter())
+            .collect();
+        teams.sort_by_key(|team| team.to_lowercase());
+        teams.dedup();
+        for team in teams {
+            if !team.to_lowercase().contains(&query) {
+                continue;
+            }
+            if ui
+                .selectable_label(self.selected_team.as_deref() == Some(team), team)
+                .clicked()
+            {
+                self.selected_team = Some(team.clone());
+            }
+        }
+    }
+
+    fn show_kit_preview(&self, ui: &mut egui::Ui) {
+        let size = egui::vec2(360.0, 360.0);
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        for name in [
+            "background",
+            "shirt",
+            "stripes",
+            "sleeves",
+            "shorts",
+            "socks",
+        ] {
+            if let Some(texture) = self.kit_textures.get(name) {
+                ui.painter().image(
+                    texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+    }
+
+    fn show_team_details(&self, ui: &mut egui::Ui) {
+        let Some(team) = &self.selected_team else {
+            ui.label("Seleziona una squadra dall'elenco.");
+            return;
+        };
+        ui.heading(team);
+        ui.label("Anteprima grafica provvisoria delle divise.");
+        ui.add_space(12.0);
+        self.show_kit_preview(ui);
+        ui.add_space(12.0);
+        ui.label("I colori, la reputazione e la rosa saranno letti dal file Team nel prossimo micro-step.");
     }
 
     fn has_changes(&self) -> bool {
@@ -697,10 +821,24 @@ impl WorldEditor {
                     .and_then(|world| world.leagues.get(*league_index))
                     .map(|league| format!("Eliminare la lega {}?", league.country))
                     .unwrap_or_else(|| "Lega non trovata".into()),
+                league_dialogs::Removal::Club {
+                    league_index,
+                    division_index,
+                    club_index,
+                    ..
+                } => self
+                    .world
+                    .as_ref()
+                    .and_then(|world| world.leagues.get(*league_index))
+                    .and_then(|league| league.divisions.get(*division_index))
+                    .and_then(|division| division.teams.get(*club_index))
+                    .map(|club| format!("Rimuovere il club {club} dalla lega?"))
+                    .unwrap_or_else(|| "Club non trovato".into()),
             };
             let delete_clubs = match dialog {
                 league_dialogs::Removal::Division { delete_clubs, .. }
                 | league_dialogs::Removal::League { delete_clubs, .. } => delete_clubs,
+                league_dialogs::Removal::Club { delete_club, .. } => delete_club,
             };
             egui::Window::new("Conferma rimozione")
                 .collapsible(false)
@@ -708,7 +846,7 @@ impl WorldEditor {
                     ui.label(description);
                     ui.checkbox(
                         delete_clubs,
-                        "Elimina anche i file dei club rimasti senza riferimenti",
+                        "Elimina anche il file del club se resta senza riferimenti",
                     );
                     ui.label("I club ancora citati nel file internazionale non saranno eliminati.");
                     ui.horizontal(|ui| {
@@ -749,6 +887,25 @@ impl WorldEditor {
                             self.selected_league = None;
                             self.selected_division = 0;
                             self.selected_club = None;
+                        }),
+                    league_dialogs::Removal::Club {
+                        league_index,
+                        division_index,
+                        club_index,
+                        delete_club,
+                    } => self
+                        .world
+                        .as_mut()
+                        .unwrap()
+                        .remove_club_from_division(
+                            league_index,
+                            division_index,
+                            club_index,
+                            delete_club,
+                        )
+                        .map(|_| {
+                            self.selected_club = None;
+                            self.sync_selected_league();
                         }),
                 };
                 if let Err(error) = result {
@@ -944,6 +1101,19 @@ impl WorldEditor {
                 .clicked()
             {
                 self.swap_source = selection;
+            }
+            if ui
+                .add_enabled(selection.is_some(), egui::Button::new("Rimuovi squadra…"))
+                .clicked()
+            {
+                self.removal = selection.map(|(league_index, division_index, club_index)| {
+                    league_dialogs::Removal::Club {
+                        league_index,
+                        division_index,
+                        club_index,
+                        delete_club: false,
+                    }
+                });
             }
         });
     }
@@ -1168,6 +1338,8 @@ impl eframe::App for WorldEditor {
                                 .hint_text("Cerca paese o file…")
                                 .desired_width(f32::INFINITY),
                         );
+                    } else if name == "Teams" {
+                        ui.label("Seleziona la lega");
                     } else {
                         let mut search_placeholder = String::new();
                         ui.add_enabled(
@@ -1183,6 +1355,8 @@ impl eframe::App for WorldEditor {
                         .show(ui, |ui| {
                             if name == "Leagues" {
                                 self.show_league_list(ui);
+                            } else if name == "Teams" {
+                                self.show_team_league_list(ui);
                             } else {
                                 ui.label("Nessun elemento");
                                 ui.label("Qui comparirà l'elenco del mondo aperto.");
@@ -1226,6 +1400,23 @@ impl eframe::App for WorldEditor {
                         });
                 });
         }
+        if name == "Teams" {
+            egui::Panel::left("team_list")
+                .default_size(300.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    ui.heading("Squadre");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.team_search)
+                            .hint_text("Cerca squadra…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("team_items")
+                        .show(ui, |ui| self.show_team_list(ui));
+                });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             if name == "Leagues" {
                 self.show_structure_toolbar(ui);
@@ -1245,6 +1436,8 @@ impl eframe::App for WorldEditor {
                     if name == "Leagues" {
                         self.show_league_details(ui);
                         self.show_division_editor(ui);
+                    } else if name == "Teams" {
+                        self.show_team_details(ui);
                     } else if name == "Transfers" {
                         ui.columns(2, |columns| {
                             Self::show_empty_roster(&mut columns[0], "Squadra di origine");
@@ -1276,6 +1469,8 @@ impl eframe::App for WorldEditor {
                         self.removal = None;
                         self.club_addition = None;
                         self.selected_club = None;
+                        self.selected_team = None;
+                        self.team_search.clear();
                         self.swap_source = None;
                         self.confirm_discard = false;
                     }
