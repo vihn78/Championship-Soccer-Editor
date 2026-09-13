@@ -1,5 +1,10 @@
 use eframe::egui;
+mod country_display;
+mod league_dialogs;
+mod league_save;
 mod leagues;
+mod world_edit;
+mod world_save;
 
 const DEFAULT_FONT_SIZE: f32 = 20.0;
 const FONT_SIZE_KEY: &str = "editor_font_size";
@@ -31,14 +36,24 @@ fn main() -> eframe::Result {
 }
 
 struct WorldEditor {
+    flags: std::collections::HashMap<String, egui::TextureHandle>,
     selected_tab: usize,
     font_size: f32,
     font_name: &'static str,
     world: Option<leagues::World>,
     selected_league: Option<usize>,
+    selected_division: usize,
+    selected_club: Option<(usize, usize, usize)>,
+    swap_source: Option<(usize, usize, usize)>,
+    saved_world: Option<leagues::World>,
+    creation: Option<league_dialogs::Creation>,
+    removal: Option<league_dialogs::Removal>,
+    club_addition: Option<league_dialogs::ClubAddition>,
+    confirm_discard: bool,
     selected_international_country: Option<usize>,
     league_search: String,
     open_error: Option<String>,
+    save_message: Option<String>,
 }
 
 impl WorldEditor {
@@ -71,14 +86,24 @@ impl WorldEditor {
         // Il tema del sistema non deve sostituire font o colori dell'editor.
         context.egui_ctx.set_theme(egui::Theme::Dark);
         let editor = Self {
+            flags: country_display::load_flags(&context.egui_ctx),
             selected_tab: 0,
             font_size,
             font_name,
             world: None,
             selected_league: None,
+            selected_division: 0,
+            selected_club: None,
+            swap_source: None,
+            saved_world: None,
+            creation: None,
+            removal: None,
+            club_addition: None,
+            confirm_discard: false,
             selected_international_country: None,
             league_search: String::new(),
             open_error: None,
+            save_message: None,
         };
         editor.apply_font_size(&context.egui_ctx);
         editor
@@ -143,7 +168,11 @@ impl WorldEditor {
     fn show_menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("Apri mondo…").clicked() {
+                if ui
+                    .add_enabled(!self.has_changes(), egui::Button::new("Apri mondo…"))
+                    .on_disabled_hover_text("Salva o scarta prima le modifiche.")
+                    .clicked()
+                {
                     ui.close();
                     if let Some(path) = rfd::FileDialog::new()
                         .set_title("Seleziona la cartella del gioco, del pacchetto o Data")
@@ -154,19 +183,32 @@ impl WorldEditor {
                             Ok(world) => {
                                 self.selected_league = (!world.leagues.is_empty()).then_some(0);
                                 self.selected_international_country = None;
+                                self.saved_world = Some(world.clone());
+                                self.creation = None;
+                                self.removal = None;
+                                self.club_addition = None;
+                                self.selected_division = 0;
+                                self.selected_club = None;
+                                self.swap_source = None;
                                 self.world = Some(world);
                                 self.league_search.clear();
                                 self.open_error = None;
+                                self.save_message = None;
                                 self.selected_tab = 1;
                             }
                             Err(error) => self.open_error = Some(error),
                         }
                     }
                 }
-                for label in ["Salva", "Esporta…"] {
-                    ui.add_enabled(false, egui::Button::new(label))
-                        .on_disabled_hover_text("Disponibile in un prossimo micro-step");
+                if ui
+                    .add_enabled(self.has_changes(), egui::Button::new("Salva"))
+                    .clicked()
+                {
+                    self.save_changes();
+                    ui.close();
                 }
+                ui.add_enabled(false, egui::Button::new("Esporta…"))
+                    .on_disabled_hover_text("Disponibile in un prossimo micro-step");
                 ui.separator();
                 if ui.button("Esci").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -208,29 +250,51 @@ impl WorldEditor {
         };
         let query = self.league_search.to_lowercase();
         let mut matches = 0;
-        for (index, league) in world.leagues.iter().enumerate() {
+        let league_name = |league: &leagues::LeagueFile| {
+            world
+                .country_names
+                .name(
+                    &league.country,
+                    league
+                        .path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&league.country),
+                )
+                .to_owned()
+        };
+        let mut sorted_leagues: Vec<_> = world.leagues.iter().enumerate().collect();
+        sorted_leagues.sort_by_cached_key(|(_, league)| league_name(league).to_lowercase());
+        for (index, league) in sorted_leagues {
+            let label = league_name(league);
             let filename = league
                 .path
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy();
-            if !league.country.to_lowercase().contains(&query)
+            if !label.to_lowercase().contains(&query)
+                && !league.country.to_lowercase().contains(&query)
                 && !filename.to_lowercase().contains(&query)
             {
                 continue;
             }
             matches += 1;
-            let label = if league.country.is_empty() {
-                filename.as_ref()
-            } else {
-                &league.country
-            };
-            if ui
-                .selectable_label(self.selected_league == Some(index), label)
-                .on_hover_text(league.path.display().to_string())
-                .clicked()
+            if country_display::flag_label(
+                ui,
+                &self.flags,
+                league
+                    .path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&league.country),
+                &label,
+                self.selected_league == Some(index),
+            )
+            .on_hover_text(league.path.display().to_string())
+            .clicked()
             {
                 self.selected_league = Some(index);
+                self.selected_division = 0;
                 self.selected_international_country = None;
             }
         }
@@ -239,23 +303,32 @@ impl WorldEditor {
         // Ordiniamo i riferimenti della vista, conservando gli indici e l'ordine dei dati.
         let mut countries_alphabetically: Vec<_> =
             world.international_countries.iter().enumerate().collect();
-        countries_alphabetically.sort_by_cached_key(|(_, country)| country.name.to_lowercase());
+        countries_alphabetically.sort_by_cached_key(|(_, country)| {
+            world
+                .country_names
+                .name(&country.name, &country.name)
+                .to_lowercase()
+        });
         for (index, country) in countries_alphabetically {
+            let label = world.country_names.name(&country.name, &country.name);
             if world
                 .leagues
                 .iter()
                 .any(|league| league.country.eq_ignore_ascii_case(&country.name))
-                || !country.name.to_lowercase().contains(&query)
+                || (!label.to_lowercase().contains(&query)
+                    && !country.name.to_lowercase().contains(&query))
             {
                 continue;
             }
             matches += 1;
-            if ui
-                .selectable_label(
-                    self.selected_international_country == Some(index),
-                    &country.name,
-                )
-                .clicked()
+            if country_display::flag_label(
+                ui,
+                &self.flags,
+                &country.name,
+                label,
+                self.selected_international_country == Some(index),
+            )
+            .clicked()
             {
                 self.selected_international_country = Some(index);
                 self.selected_league = None;
@@ -286,10 +359,11 @@ impl WorldEditor {
             .selected_international_country
             .and_then(|index| world.international_countries.get(index))
         {
-            ui.heading(&country.name);
+            let label = world.country_names.name(&country.name, &country.name);
+            country_display::flag_label(ui, &self.flags, &country.name, label, false);
             ui.label("Nessun campionato presente nel mondo aperto.");
             ui.label("Questi club saranno il punto di partenza per la nuova lega.");
-            Self::show_international_clubs(ui, country);
+            Self::show_international_clubs(ui, country, None);
             return;
         }
         let Some(league) = self
@@ -299,10 +373,16 @@ impl WorldEditor {
             ui.label("Seleziona un campionato dall'elenco.");
             return;
         };
-        ui.heading(&league.country);
+        let identity = league
+            .path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&league.country);
+        let label = world.country_names.name(&league.country, identity);
+        country_display::flag_label(ui, &self.flags, identity, label, false);
         ui.label(league.path.display().to_string());
         ui.label(format!(
-            "{} divisioni • Sola lettura",
+            "{} divisioni • Modifica in memoria",
             league.divisions.len()
         ));
         if let Some(country) = world
@@ -310,41 +390,647 @@ impl WorldEditor {
             .iter()
             .find(|country| country.name.eq_ignore_ascii_case(&league.country))
         {
-            egui::CollapsingHeader::new("Club di riserva internazionali")
+            egui::CollapsingHeader::new("Club richiamati dal file internazionale")
                 .id_salt(("international_clubs", &league.path))
                 .show(ui, |ui| {
                     ui.label("Usati quando il campionato non è selezionato nella carriera.");
-                    Self::show_international_clubs(ui, country);
+                    ui.label("I nomi corrispondenti richiamano gli stessi club del campionato.");
+                    Self::show_international_clubs(ui, country, Some(league));
                 });
-        }
-        let value = |number: Option<u32>| {
-            number.map_or_else(|| "non definito".into(), |number| number.to_string())
-        };
-        // Gli indici identificano anche divisioni con nomi ripetuti; niente ordinamento dei club.
-        for (index, division) in league.divisions.iter().enumerate() {
-            egui::CollapsingHeader::new(format!(
-                "{} · {} · {} squadre",
-                value(division.level),
-                division.name,
-                division.teams.len()
-            ))
-            .id_salt((&league.path, index))
-            .default_open(index == 0)
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("Promozioni: {}", value(division.promotions)));
-                    ui.label(format!("Retrocessioni: {}", value(division.relegations)));
-                    ui.label(format!("Reputazione: {}", value(division.reputation)));
-                });
-                ui.separator();
-                for (team_index, team) in division.teams.iter().enumerate() {
-                    ui.label(format!("{:>2}. {}", team_index + 1, team));
-                }
-            });
         }
     }
 
-    fn show_international_clubs(ui: &mut egui::Ui, country: &leagues::InternationalCountry) {
+    fn has_changes(&self) -> bool {
+        match (&self.world, &self.saved_world) {
+            (Some(world), Some(saved)) => {
+                world.leagues.len() != saved.leagues.len()
+                    || world
+                        .leagues
+                        .iter()
+                        .zip(&saved.leagues)
+                        .any(|(league, old)| {
+                            league.path != old.path
+                                || league.divisions != old.divisions
+                                || league.division_sources != old.division_sources
+                        })
+                    || world.international_countries != saved.international_countries
+                    || !world.retained_clubs.is_empty()
+                    || !world.deleted_clubs.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    fn save_changes(&mut self) {
+        self.save_message = None;
+        let (Some(world), Some(saved)) = (&mut self.world, &self.saved_world) else {
+            return;
+        };
+        // Sincronizza solo le leghe modificate: l'apertura da sola non riscrive gli altri paesi.
+        for index in 0..world.leagues.len() {
+            if saved
+                .leagues
+                .iter()
+                .find(|old| old.path == world.leagues[index].path)
+                .is_none_or(|old| old.divisions != world.leagues[index].divisions)
+                && let Err(error) = world.sync_international(index)
+            {
+                self.open_error = Some(error);
+                return;
+            }
+        }
+        let changes = match world_save::prepare(world, saved) {
+            Ok(changes) => changes,
+            Err(error) => {
+                self.open_error = Some(format!("Nessun file salvato.\n{error}"));
+                return;
+            }
+        };
+        let staging = world.league_directory.parent().unwrap();
+        if let Err(error) = world_save::commit(&changes, staging) {
+            self.open_error = Some(error);
+            return;
+        }
+        world_save::mark_saved(world, &changes);
+        self.saved_world = Some(world.clone());
+        self.open_error = None;
+        self.save_message = Some(format!(
+            "Salvate {} operazioni su file, senza backup automatici.",
+            changes.len()
+        ));
+    }
+
+    fn sync_selected_league(&mut self) {
+        if let (Some(world), Some(index)) = (&mut self.world, self.selected_league)
+            && let Err(error) = world.sync_international(index)
+        {
+            self.open_error = Some(error);
+        }
+    }
+
+    fn begin_creation(&mut self, league: bool) {
+        let Some(world) = &self.world else {
+            return;
+        };
+        self.creation = if league {
+            let country =
+                self.selected_international_country
+                    .and_then(|index| world.international_countries.get(index))
+                    .filter(|country| {
+                        !world
+                            .leagues
+                            .iter()
+                            .any(|league| league.country.eq_ignore_ascii_case(&country.name))
+                    })
+                    .map(|country| country.name.clone())
+                    .or_else(|| {
+                        world
+                            .international_countries
+                            .iter()
+                            .find(|country| {
+                                !world.leagues.iter().any(|league| {
+                                    league.country.eq_ignore_ascii_case(&country.name)
+                                })
+                            })
+                            .map(|country| country.name.clone())
+                    })
+                    .unwrap_or_default();
+            Some(league_dialogs::Creation {
+                kind: league_dialogs::CreationKind::League,
+                country,
+                division_name: "Prima divisione".into(),
+                clubs: String::new(),
+            })
+        } else {
+            self.selected_league.map(|index| league_dialogs::Creation {
+                kind: league_dialogs::CreationKind::Division {
+                    league_index: index,
+                },
+                country: String::new(),
+                division_name: format!("Divisione {}", world.leagues[index].divisions.len() + 1),
+                clubs: String::new(),
+            })
+        };
+    }
+
+    fn show_structure_toolbar(&mut self, ui: &mut egui::Ui) {
+        let selected = self.selected_league;
+        let can_add = selected.is_some_and(|index| {
+            self.world
+                .as_ref()
+                .is_some_and(|world| world.leagues[index].divisions.len() < 12)
+        });
+        let can_remove = selected.is_some_and(|index| {
+            self.world
+                .as_ref()
+                .is_some_and(|world| world.can_remove_division(index, self.selected_division))
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(can_add, egui::Button::new("Nuova divisione…"))
+                .clicked()
+            {
+                self.begin_creation(false);
+            }
+            if ui
+                .add_enabled(can_remove, egui::Button::new("Rimuovi divisione…"))
+                .clicked()
+            {
+                self.removal = Some(league_dialogs::Removal::Division {
+                    league_index: selected.unwrap(),
+                    division_index: self.selected_division,
+                    delete_clubs: false,
+                });
+            }
+            if ui
+                .add_enabled(selected.is_some(), egui::Button::new("Elimina lega…"))
+                .clicked()
+            {
+                self.removal = Some(league_dialogs::Removal::League {
+                    league_index: selected.unwrap(),
+                    delete_clubs: false,
+                });
+            }
+            if ui
+                .add_enabled(selected.is_some(), egui::Button::new("Aggiungi squadra…"))
+                .clicked()
+            {
+                self.club_addition = selected.map(|league_index| league_dialogs::ClubAddition {
+                    league_index,
+                    division_index: self.selected_division,
+                    source: league_dialogs::ClubSource::Neutral,
+                    club_name: String::new(),
+                });
+            }
+        });
+    }
+
+    fn show_structure_dialogs(&mut self, context: &egui::Context) {
+        let mut create = false;
+        let mut close_creation = false;
+        if let Some(dialog) = &mut self.creation {
+            let countries: Vec<String> =
+                self.world
+                    .as_ref()
+                    .map(|world| {
+                        world
+                            .international_countries
+                            .iter()
+                            .filter(|country| {
+                                !world.leagues.iter().any(|league| {
+                                    league.country.eq_ignore_ascii_case(&country.name)
+                                })
+                            })
+                            .map(|country| country.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            let title = if dialog.kind == league_dialogs::CreationKind::League {
+                "Nuova lega"
+            } else {
+                "Nuova divisione"
+            };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(true)
+                .show(context, |ui| {
+                    match dialog.kind {
+                        league_dialogs::CreationKind::League => {
+                            ui.label("Paese senza campionato domestico");
+                            egui::ComboBox::from_id_salt("new_league_country")
+                                .selected_text(&dialog.country)
+                                .show_ui(ui, |ui| {
+                                    for country in &countries {
+                                        ui.selectable_value(
+                                            &mut dialog.country,
+                                            country.clone(),
+                                            country,
+                                        );
+                                    }
+                                });
+                            ui.label(
+                                "I club internazionali del paese saranno aggiunti automaticamente.",
+                            );
+                        }
+                        league_dialogs::CreationKind::Division { .. } => {
+                            ui.label("Inserisci da 3 a 24 club, uno per riga.");
+                        }
+                    }
+                    ui.label("Nome della divisione");
+                    ui.text_edit_singleline(&mut dialog.division_name);
+                    ui.label("Club aggiuntivi / club della nuova divisione");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut dialog.clubs)
+                            .desired_rows(8)
+                            .desired_width(520.0),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Crea").clicked() {
+                            create = true;
+                        }
+                        if ui.button("Annulla").clicked() {
+                            close_creation = true;
+                        }
+                    });
+                });
+        }
+        if create {
+            if let Some(dialog) = self.creation.take() {
+                let clubs = dialog
+                    .clubs
+                    .lines()
+                    .map(str::trim)
+                    .filter(|club| !club.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                let result = match dialog.kind {
+                    league_dialogs::CreationKind::League => self
+                        .world
+                        .as_mut()
+                        .unwrap()
+                        .create_league(&dialog.country, &dialog.division_name, clubs)
+                        .map(|index| {
+                            self.selected_league = Some(index);
+                            self.selected_international_country = None;
+                            self.selected_division = 0;
+                        }),
+                    league_dialogs::CreationKind::Division { league_index } => self
+                        .world
+                        .as_mut()
+                        .unwrap()
+                        .add_division(league_index, &dialog.division_name, clubs)
+                        .map(|_| {
+                            self.selected_league = Some(league_index);
+                            self.selected_division = self.world.as_ref().unwrap().leagues
+                                [league_index]
+                                .divisions
+                                .len()
+                                - 1;
+                        }),
+                };
+                if let Err(error) = result {
+                    self.open_error = Some(error);
+                }
+            }
+        } else if close_creation {
+            self.creation = None;
+        }
+
+        let mut confirm_removal = false;
+        let mut close_removal = false;
+        if let Some(dialog) = &mut self.removal {
+            let description = match dialog {
+                league_dialogs::Removal::Division {
+                    league_index,
+                    division_index,
+                    ..
+                } => self
+                    .world
+                    .as_ref()
+                    .and_then(|world| world.leagues.get(*league_index))
+                    .and_then(|league| league.divisions.get(*division_index))
+                    .map(|division| format!("Rimuovere la divisione {}?", division.name))
+                    .unwrap_or_else(|| "Divisione non trovata".into()),
+                league_dialogs::Removal::League { league_index, .. } => self
+                    .world
+                    .as_ref()
+                    .and_then(|world| world.leagues.get(*league_index))
+                    .map(|league| format!("Eliminare la lega {}?", league.country))
+                    .unwrap_or_else(|| "Lega non trovata".into()),
+            };
+            let delete_clubs = match dialog {
+                league_dialogs::Removal::Division { delete_clubs, .. }
+                | league_dialogs::Removal::League { delete_clubs, .. } => delete_clubs,
+            };
+            egui::Window::new("Conferma rimozione")
+                .collapsible(false)
+                .show(context, |ui| {
+                    ui.label(description);
+                    ui.checkbox(
+                        delete_clubs,
+                        "Elimina anche i file dei club rimasti senza riferimenti",
+                    );
+                    ui.label("I club ancora citati nel file internazionale non saranno eliminati.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Rimuovi").clicked() {
+                            confirm_removal = true;
+                        }
+                        if ui.button("Annulla").clicked() {
+                            close_removal = true;
+                        }
+                    });
+                });
+        }
+        if confirm_removal {
+            if let Some(dialog) = self.removal.take() {
+                let result = match dialog {
+                    league_dialogs::Removal::Division {
+                        league_index,
+                        division_index,
+                        delete_clubs,
+                    } => self
+                        .world
+                        .as_mut()
+                        .unwrap()
+                        .remove_division(league_index, division_index, delete_clubs)
+                        .map(|_| {
+                            self.selected_division = self.selected_division.saturating_sub(1);
+                            self.selected_club = None;
+                        }),
+                    league_dialogs::Removal::League {
+                        league_index,
+                        delete_clubs,
+                    } => self
+                        .world
+                        .as_mut()
+                        .unwrap()
+                        .remove_league(league_index, delete_clubs)
+                        .map(|_| {
+                            self.selected_league = None;
+                            self.selected_division = 0;
+                            self.selected_club = None;
+                        }),
+                };
+                if let Err(error) = result {
+                    self.open_error = Some(error);
+                }
+            }
+        } else if close_removal {
+            self.removal = None;
+        }
+
+        let mut add_club = false;
+        let mut close_club_addition = false;
+        if let Some(dialog) = &mut self.club_addition {
+            let neutral_clubs = self
+                .world
+                .as_ref()
+                .map(leagues::World::neutral_clubs)
+                .unwrap_or_default();
+            egui::Window::new("Aggiungi squadra")
+                .collapsible(false)
+                .show(context, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut dialog.source,
+                            league_dialogs::ClubSource::Neutral,
+                            "Club neutro esistente",
+                        );
+                        ui.selectable_value(
+                            &mut dialog.source,
+                            league_dialogs::ClubSource::New,
+                            "Nuovo club",
+                        );
+                    });
+                    match dialog.source {
+                        league_dialogs::ClubSource::Neutral => {
+                            if neutral_clubs.is_empty() {
+                                ui.label("Non esistono club neutri con un file Team disponibile.");
+                            } else {
+                                egui::ComboBox::from_id_salt("neutral_club")
+                                    .selected_text(if dialog.club_name.is_empty() {
+                                        "Scegli un club…"
+                                    } else {
+                                        &dialog.club_name
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        for club in &neutral_clubs {
+                                            ui.selectable_value(
+                                                &mut dialog.club_name,
+                                                club.clone(),
+                                                club,
+                                            );
+                                        }
+                                    });
+                            }
+                        }
+                        league_dialogs::ClubSource::New => {
+                            ui.label("Nome del nuovo club");
+                            ui.text_edit_singleline(&mut dialog.club_name);
+                            ui.label("Dettagli e rosa saranno configurabili nella tab Teams.");
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        let valid_selection = match dialog.source {
+                            league_dialogs::ClubSource::Neutral => {
+                                neutral_clubs.iter().any(|club| club == &dialog.club_name)
+                            }
+                            league_dialogs::ClubSource::New => !dialog.club_name.trim().is_empty(),
+                        };
+                        if ui
+                            .add_enabled(valid_selection, egui::Button::new("Aggiungi"))
+                            .clicked()
+                        {
+                            add_club = true;
+                        }
+                        if ui.button("Annulla").clicked() {
+                            close_club_addition = true;
+                        }
+                    });
+                });
+        }
+        if add_club {
+            if let Some(dialog) = self.club_addition.take()
+                && let Err(error) = self.world.as_mut().unwrap().add_club_to_division(
+                    dialog.league_index,
+                    dialog.division_index,
+                    dialog.club_name.trim(),
+                )
+            {
+                self.open_error = Some(error);
+            }
+        } else if close_club_addition {
+            self.club_addition = None;
+        }
+    }
+
+    fn show_division_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(league) = self.world.as_mut().and_then(|world| {
+            self.selected_league
+                .and_then(|index| world.leagues.get_mut(index))
+        }) else {
+            return;
+        };
+        let (level, promotions, relegations, promotions_changed, relegations_changed, teams) = {
+            let Some(division) = league.divisions.get_mut(self.selected_division) else {
+                return;
+            };
+            ui.separator();
+            ui.heading("Parametri della divisione");
+            ui.label("Nome");
+            ui.text_edit_singleline(&mut division.name);
+            Self::number_field(ui, "Livello", &mut division.level, 1);
+            Self::number_field(ui, "Reputazione", &mut division.reputation, 10);
+            let promotions_changed =
+                Self::number_field(ui, "Promozioni", &mut division.promotions, 0);
+            let relegations_changed =
+                Self::number_field(ui, "Retrocessioni", &mut division.relegations, 0);
+            (
+                division.level,
+                division.promotions,
+                division.relegations,
+                promotions_changed,
+                relegations_changed,
+                division.teams.clone(),
+            )
+        };
+        // Le due estremità dello stesso passaggio di categoria devono restare uguali.
+        if let Some(level) = level {
+            if promotions_changed
+                && let Some(above) = league
+                    .divisions
+                    .iter_mut()
+                    .find(|division| division.level == level.checked_sub(1))
+            {
+                above.relegations = promotions;
+            }
+            if relegations_changed
+                && let Some(below) = league
+                    .divisions
+                    .iter_mut()
+                    .find(|division| division.level == level.checked_add(1))
+            {
+                below.promotions = relegations;
+            }
+        }
+        for issue in league.division_issues(self.selected_division) {
+            ui.colored_label(egui::Color32::from_rgb(255, 195, 110), issue);
+        }
+        ui.separator();
+        ui.heading(format!("Squadre ({})", teams.len()));
+        ui.label("Ordine iniziale usato per l'accesso alle coppe.");
+        // La colonna gestisce lo scorrimento: nessuna area annidata per la rosa.
+        for (index, team) in teams.iter().enumerate() {
+            let selection = (self.selected_league.unwrap(), self.selected_division, index);
+            if ui
+                .selectable_label(
+                    self.selected_club == Some(selection),
+                    format!("{:>2}. {team}", index + 1),
+                )
+                .clicked()
+            {
+                self.selected_club = Some(selection);
+            }
+        }
+    }
+
+    fn show_club_toolbar(&mut self, ui: &mut egui::Ui) {
+        let selection = self.selected_club.filter(|(country, division, _)| {
+            Some(*country) == self.selected_league && *division == self.selected_division
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (label, up) in [("Sposta su", true), ("Sposta giù", false)] {
+                let enabled = selection.is_some_and(|(country, division, position)| {
+                    self.world.as_ref().is_some_and(|world| {
+                        world.leagues[country]
+                            .move_target(division, position, up)
+                            .is_some()
+                    })
+                });
+                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                    let (country, division, position) = selection.unwrap();
+                    if let Some((target_division, target_position)) =
+                        self.world.as_mut().unwrap().leagues[country]
+                            .move_club(division, position, up)
+                    {
+                        self.selected_division = target_division;
+                        self.selected_club = Some((country, target_division, target_position));
+                        self.sync_selected_league();
+                    }
+                }
+            }
+            if ui
+                .add_enabled(selection.is_some(), egui::Button::new("Scambia squadre…"))
+                .clicked()
+            {
+                self.swap_source = selection;
+            }
+        });
+    }
+
+    fn show_swap_window(&mut self, context: &egui::Context) {
+        let Some((country, division, position)) = self.swap_source else {
+            return;
+        };
+        let Some(league) = self
+            .world
+            .as_ref()
+            .and_then(|world| world.leagues.get(country))
+        else {
+            self.swap_source = None;
+            return;
+        };
+        let source_name = league.divisions[division].teams[position].clone();
+        let mut destination = None;
+        let mut open = true;
+        egui::Window::new("Scambia squadre nello stesso paese")
+            .open(&mut open)
+            .default_width(600.0)
+            .show(context, |ui| {
+                ui.label(format!("Scambia {source_name} con:"));
+                egui::ScrollArea::vertical()
+                    .max_height(500.0)
+                    .show(ui, |ui| {
+                        let mut divisions: Vec<_> = league.divisions.iter().enumerate().collect();
+                        divisions.sort_by_key(|(_, item)| item.level);
+                        for (division_index, item) in divisions {
+                            egui::CollapsingHeader::new(&item.name)
+                                .id_salt(("swap_division", division_index))
+                                .show(ui, |ui| {
+                                    for (team_index, team) in item.teams.iter().enumerate() {
+                                        if (division_index, team_index) != (division, position)
+                                            && ui
+                                                .button(format!("{}. {team}", team_index + 1))
+                                                .clicked()
+                                        {
+                                            destination = Some((division_index, team_index));
+                                        }
+                                    }
+                                });
+                        }
+                    });
+            });
+        if let Some(target) = destination {
+            self.world.as_mut().unwrap().leagues[country].swap_clubs((division, position), target);
+            self.selected_league = Some(country);
+            self.selected_international_country = None;
+            self.selected_division = target.0;
+            self.selected_club = Some((country, target.0, target.1));
+            self.sync_selected_league();
+            self.swap_source = None;
+        } else if !open {
+            self.swap_source = None;
+        }
+    }
+
+    fn number_field(ui: &mut egui::Ui, label: &str, value: &mut Option<u32>, default: u32) -> bool {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let before = *value;
+            if let Some(number) = value {
+                if ui.small_button("−").clicked() {
+                    *number = number.saturating_sub(1);
+                }
+                ui.add(egui::DragValue::new(number).range(0..=999));
+                if ui.small_button("+").clicked() {
+                    *number = number.saturating_add(1);
+                }
+            } else {
+                ui.label("Non definito");
+                if ui.button("Imposta").clicked() {
+                    *value = Some(default);
+                }
+            }
+            *value != before
+        })
+        .inner
+    }
+
+    fn show_international_clubs(
+        ui: &mut egui::Ui,
+        country: &leagues::InternationalCountry,
+        league: Option<&leagues::LeagueFile>,
+    ) {
         ui.label("Fonte: International teams and tournaments.txt • Sola lettura");
         if let Some(reputation) = country.reputation {
             ui.label(format!("Reputazione: {reputation}"));
@@ -354,7 +1040,44 @@ impl WorldEditor {
         }
         ui.label(format!("{} club", country.clubs.len()));
         for (index, club) in country.clubs.iter().enumerate() {
-            ui.label(format!("{:>2}. {club}", index + 1));
+            let Some(league) = league else {
+                ui.label(format!("{:>2}. {club}", index + 1));
+                continue;
+            };
+            let locations = league.club_locations(club);
+            match locations.as_slice() {
+                [(division, position)] => {
+                    ui.label(format!(
+                        "{:>2}. {club} — {} · posizione {}",
+                        index + 1,
+                        league.divisions[*division].name,
+                        position + 1
+                    ));
+                }
+                [] => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 195, 110),
+                        format!("{:>2}. {club} — Non presente nel campionato", index + 1),
+                    );
+                }
+                _ => {
+                    let details = locations
+                        .iter()
+                        .map(|(division, position)| {
+                            format!(
+                                "{} · posizione {}",
+                                league.divisions[*division].name,
+                                position + 1
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 195, 110),
+                        format!("{:>2}. {club} — Duplicato: {details}", index + 1),
+                    );
+                }
+            }
         }
     }
 }
@@ -362,8 +1085,38 @@ impl WorldEditor {
 impl eframe::App for WorldEditor {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let previous_font_size = self.font_size;
+        if self.has_changes() && ui.ctx().input(|input| input.viewport().close_requested()) {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.open_error = Some(
+                "Ci sono modifiche non salvate. Salva o scarta le modifiche prima di chiudere."
+                    .into(),
+            );
+        }
         egui::Panel::top("menu").show(ui, |ui| {
             self.show_menu(ui);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(self.has_changes(), egui::Button::new("Salva modifiche"))
+                    .clicked()
+                {
+                    self.save_changes();
+                }
+                if ui
+                    .add_enabled(self.has_changes(), egui::Button::new("Scarta modifiche"))
+                    .clicked()
+                {
+                    self.confirm_discard = true;
+                }
+                ui.label(if self.has_changes() {
+                    "Modifiche non salvate • solo in memoria"
+                } else {
+                    "Nessuna modifica"
+                });
+            });
+            if let Some(message) = &self.save_message {
+                ui.label(message);
+            }
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.strong("WORLD EDITOR");
@@ -385,7 +1138,7 @@ impl eframe::App for WorldEditor {
                     || "Nessun dato caricato".into(),
                     |world| {
                         format!(
-                            "{} file nazionali • {} segnalazioni • Sola lettura",
+                            "{} file nazionali • {} segnalazioni • Editor leghe",
                             world.leagues.len(),
                             world.warnings.len()
                         )
@@ -404,6 +1157,12 @@ impl eframe::App for WorldEditor {
                     // Titolo e ricerca restano fissi: solo gli elementi scorrono.
                     ui.heading(name);
                     if name == "Leagues" {
+                        if ui
+                            .add_enabled(self.world.is_some(), egui::Button::new("Nuova lega…"))
+                            .clicked()
+                        {
+                            self.begin_creation(true);
+                        }
                         ui.add(
                             egui::TextEdit::singleline(&mut self.league_search)
                                 .hint_text("Cerca paese o file…")
@@ -431,30 +1190,102 @@ impl eframe::App for WorldEditor {
                         });
                 });
         }
+        if name == "Leagues" {
+            egui::Panel::left("division_list")
+                .default_size(270.0)
+                .resizable(true)
+                .show(ui, |ui| {
+                    ui.heading("Divisioni");
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("division_items")
+                        .show(ui, |ui| {
+                            if let Some(league) = self.world.as_ref().and_then(|world| {
+                                self.selected_league
+                                    .and_then(|index| world.leagues.get(index))
+                            }) {
+                                let mut divisions: Vec<_> =
+                                    league.divisions.iter().enumerate().collect();
+                                divisions.sort_by_key(|(_, division)| division.level);
+                                for (index, division) in divisions {
+                                    ui.selectable_value(
+                                        &mut self.selected_division,
+                                        index,
+                                        format!(
+                                            "{} · {}",
+                                            division
+                                                .level
+                                                .map_or("?".into(), |value| value.to_string()),
+                                            division.name
+                                        ),
+                                    );
+                                }
+                            } else {
+                                ui.label("Seleziona un campionato.");
+                            }
+                        });
+                });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::both().show(ui, |ui| {
-                ui.add_space(12.0);
-                ui.heading(name);
-                ui.label(description);
-                ui.add_space(16.0);
+            if name == "Leagues" {
+                self.show_structure_toolbar(ui);
+                self.show_club_toolbar(ui);
                 ui.separator();
-                ui.add_space(16.0);
-                if name == "Leagues" {
-                    self.show_league_details(ui);
-                } else if name == "Transfers" {
-                    ui.columns(2, |columns| {
-                        Self::show_empty_roster(&mut columns[0], "Squadra di origine");
-                        Self::show_empty_roster(&mut columns[1], "Squadra di destinazione");
-                    });
-                } else {
-                    ui.heading("Il tuo mondo comincia qui");
-                    ui.label("Questa sezione sarà disponibile in un prossimo micro-step.");
-                    ui.label("Selezionando un elemento vedrai qui i suoi dettagli.");
-                }
-            });
+            }
+            egui::ScrollArea::both()
+                .id_salt(("details_content", name))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_space(12.0);
+                    ui.heading(name);
+                    ui.label(description);
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(16.0);
+                    if name == "Leagues" {
+                        self.show_league_details(ui);
+                        self.show_division_editor(ui);
+                    } else if name == "Transfers" {
+                        ui.columns(2, |columns| {
+                            Self::show_empty_roster(&mut columns[0], "Squadra di origine");
+                            Self::show_empty_roster(&mut columns[1], "Squadra di destinazione");
+                        });
+                    } else {
+                        ui.heading("Il tuo mondo comincia qui");
+                        ui.label("Questa sezione sarà disponibile in un prossimo micro-step.");
+                        ui.label("Selezionando un elemento vedrai qui i suoi dettagli.");
+                    }
+                });
         });
+        self.show_swap_window(ui.ctx());
+        self.show_structure_dialogs(ui.ctx());
+        if self.confirm_discard {
+            egui::Window::new("Scartare le modifiche?")
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Leghe, divisioni e club torneranno all’ultimo stato salvato.");
+                    if ui.button("Scarta tutte le modifiche").clicked() {
+                        self.world = self.saved_world.clone();
+                        self.selected_league = self
+                            .world
+                            .as_ref()
+                            .and_then(|world| (!world.leagues.is_empty()).then_some(0));
+                        self.selected_division = 0;
+                        self.selected_international_country = None;
+                        self.creation = None;
+                        self.removal = None;
+                        self.club_addition = None;
+                        self.selected_club = None;
+                        self.swap_source = None;
+                        self.confirm_discard = false;
+                    }
+                    if ui.button("Continua a modificare").clicked() {
+                        self.confirm_discard = false;
+                    }
+                });
+        }
         if let Some(error) = self.open_error.clone() {
-            egui::Window::new("Impossibile aprire il mondo")
+            egui::Window::new("Operazione non completata")
                 .collapsible(false)
                 .resizable(true)
                 .show(ui.ctx(), |ui| {

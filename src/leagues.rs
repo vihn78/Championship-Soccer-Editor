@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Division {
     pub name: String,
     pub level: Option<u32>,
@@ -10,15 +10,175 @@ pub struct Division {
     pub teams: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct LeagueFile {
+    pub division_sources: Vec<Option<usize>>,
+    pub name_files: Vec<String>,
+    pub source_bytes: Vec<u8>,
     pub path: PathBuf,
     pub country: String,
     pub divisions: Vec<Division>,
     pub warnings: Vec<String>,
 }
 
+impl LeagueFile {
+    pub fn swap_clubs(&mut self, source: (usize, usize), target: (usize, usize)) -> bool {
+        let club = |position: (usize, usize)| {
+            self.divisions
+                .get(position.0)
+                .and_then(|division| division.teams.get(position.1))
+                .cloned()
+        };
+        let (Some(first), Some(second)) = (club(source), club(target)) else {
+            return false;
+        };
+        if source == target {
+            return false;
+        }
+        self.divisions[source.0].teams[source.1] = second;
+        self.divisions[target.0].teams[target.1] = first;
+        true
+    }
+
+    pub fn move_target(
+        &self,
+        division: usize,
+        position: usize,
+        up: bool,
+    ) -> Option<(usize, usize)> {
+        let current = self.divisions.get(division)?;
+        current.teams.get(position)?;
+        if up && position > 0 {
+            return Some((division, position - 1));
+        }
+        if !up && position + 1 < current.teams.len() {
+            return Some((division, position + 1));
+        }
+        let level = current.level?;
+        // Livelli ambigui o mancanti non devono provocare scambi con la divisione sbagliata.
+        if self
+            .divisions
+            .iter()
+            .filter(|item| item.level == Some(level))
+            .count()
+            != 1
+        {
+            return None;
+        }
+        let adjacent_level = if up {
+            level.checked_sub(1)?
+        } else {
+            level.checked_add(1)?
+        };
+        let mut adjacent = self
+            .divisions
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.level == Some(adjacent_level));
+        let (index, target) = adjacent.next()?;
+        if adjacent.next().is_some() || target.teams.is_empty() {
+            return None;
+        }
+        Some((index, if up { target.teams.len() - 1 } else { 0 }))
+    }
+
+    pub fn move_club(
+        &mut self,
+        division: usize,
+        position: usize,
+        up: bool,
+    ) -> Option<(usize, usize)> {
+        let target = self.move_target(division, position, up)?;
+        self.swap_clubs((division, position), target)
+            .then_some(target)
+    }
+    /// Confronto esatto dei nomi già ripuliti dal parser, in tutte le divisioni del paese.
+    /// Più risultati indicano un duplicato: nessuna corrispondenza viene scelta arbitrariamente.
+    pub fn club_locations(&self, club: &str) -> Vec<(usize, usize)> {
+        self.divisions
+            .iter()
+            .enumerate()
+            .flat_map(|(division_index, division)| {
+                division
+                    .teams
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(team_index, name)| {
+                        (name == club).then_some((division_index, team_index))
+                    })
+            })
+            .collect()
+    }
+    pub fn division_issues(&self, index: usize) -> Vec<String> {
+        let division = &self.divisions[index];
+        let mut issues = Vec::new();
+        if division.name.trim().is_empty() {
+            issues.push("Nome: inserisci il nome della divisione.".into());
+        }
+        if let Some(level) = division.level {
+            if level == 0 {
+                issues.push("Livello: deve essere maggiore di zero.".into());
+            }
+            if self
+                .divisions
+                .iter()
+                .enumerate()
+                .any(|(other, value)| other != index && value.level == Some(level))
+            {
+                issues.push("Livello: già occupato da un'altra divisione.".into());
+            }
+            if level == 1 && division.promotions.is_some_and(|value| value != 0) {
+                issues.push("Promozioni: la prima divisione deve avere zero promozioni.".into());
+            }
+            if let Some(above) = self
+                .divisions
+                .iter()
+                .find(|other| other.level == level.checked_sub(1))
+                && division.promotions != above.relegations
+            {
+                issues.push(format!(
+                    "Promozioni: devono corrispondere alle retrocessioni di {}.",
+                    above.name
+                ));
+            }
+            if let Some(below) = self
+                .divisions
+                .iter()
+                .find(|other| other.level == level.checked_add(1))
+            {
+                if division.relegations != below.promotions {
+                    issues.push(format!(
+                        "Retrocessioni: devono corrispondere alle promozioni di {}.",
+                        below.name
+                    ));
+                }
+            } else if !self
+                .divisions
+                .iter()
+                .any(|other| other.level.is_some_and(|other| other > level))
+                && division.relegations.is_some_and(|value| value != 0)
+            {
+                issues.push(
+                    "Retrocessioni: l'ultima divisione deve avere zero retrocessioni.".into(),
+                );
+            }
+        }
+        if division
+            .reputation
+            .is_some_and(|value| !(1..=20).contains(&value))
+        {
+            issues.push("Reputazione: usa un valore da 1 a 20.".into());
+        }
+        issues
+    }
+}
+
+#[derive(Clone)]
 pub struct World {
+    pub international_bytes: Vec<u8>,
+    pub retained_clubs: std::collections::BTreeSet<String>,
+    pub deleted_clubs: std::collections::BTreeSet<String>,
+    pub country_names: crate::country_display::CountryNames,
     pub league_directory: PathBuf,
     pub leagues: Vec<LeagueFile>,
     pub international_file: Option<PathBuf>,
@@ -26,7 +186,7 @@ pub struct World {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct InternationalCountry {
     pub name: String,
     pub name_files: Vec<String>,
@@ -35,7 +195,9 @@ pub struct InternationalCountry {
 }
 
 /// Legge esclusivamente i blocchi paese; le istruzioni delle coppe restano separate.
-fn parse_international_countries(text: &str) -> (Vec<InternationalCountry>, Vec<String>) {
+pub(crate) fn parse_international_countries(
+    text: &str,
+) -> (Vec<InternationalCountry>, Vec<String>) {
     let mut countries: Vec<InternationalCountry> = Vec::new();
     let mut warnings = Vec::new();
     let mut current = None;
@@ -125,12 +287,18 @@ pub fn load_world(selected: &Path) -> Result<World, String> {
     let entries = std::fs::read_dir(&directory)
         .map_err(|error| format!("{}: {error}", directory.display()))?;
     let mut world = World {
+        international_bytes: Vec::new(),
+        retained_clubs: Default::default(),
+        deleted_clubs: Default::default(),
+        country_names: crate::country_display::CountryNames,
         league_directory: directory,
         leagues: Vec::new(),
         international_file: None,
         international_countries: Vec::new(),
         warnings: Vec::new(),
     };
+    // Il gioco ha un problema con alcuni display name nelle competizioni nazionali.
+    // Perciò l'editor usa l'identità dei file e non legge Nationalities.txt.
     let mut paths = Vec::new();
     for entry in entries {
         match entry {
@@ -159,6 +327,7 @@ pub fn load_world(selected: &Path) -> Result<World, String> {
                 Ok(bytes) => {
                     let (countries, warnings) = parse_international_countries(&decode_text(&bytes));
                     world.international_countries = countries;
+                    world.international_bytes = bytes;
                     world.warnings.extend(
                         warnings
                             .into_iter()
@@ -173,7 +342,8 @@ pub fn load_world(selected: &Path) -> Result<World, String> {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let text = decode_text(&bytes);
-                let league = parse_league(&path, &text);
+                let mut league = parse_league(&path, &text);
+                league.source_bytes = bytes;
                 world.warnings.extend(
                     league
                         .warnings
@@ -195,7 +365,7 @@ pub fn load_world(selected: &Path) -> Result<World, String> {
     Ok(world)
 }
 
-fn decode_text(bytes: &[u8]) -> String {
+pub(crate) fn decode_text(bytes: &[u8]) -> String {
     // UTF-8 valido (anche con BOM) oppure il Windows-1252 dei dati storici.
     match std::str::from_utf8(bytes) {
         Ok(text) => text.trim_start_matches('\u{feff}').to_owned(),
@@ -203,8 +373,9 @@ fn decode_text(bytes: &[u8]) -> String {
     }
 }
 
-fn parse_league(path: &Path, text: &str) -> LeagueFile {
+pub(crate) fn parse_league(path: &Path, text: &str) -> LeagueFile {
     let mut league = LeagueFile {
+        source_bytes: text.as_bytes().to_vec(),
         path: path.to_path_buf(),
         ..Default::default()
     };
@@ -245,7 +416,13 @@ fn parse_league(path: &Path, text: &str) -> LeagueFile {
                             .push(warning("Paese mancante o virgolette non valide"));
                     }
                 }
-                "names" | "intro" => {}
+                "names" => {
+                    let parts: Vec<_> = value.split('"').collect();
+                    if parts.len() == 5 {
+                        league.name_files = vec![parts[1].into(), parts[3].into()];
+                    }
+                }
+                "intro" => {}
                 _ => league.warnings.push(warning("Istruzione non riconosciuta")),
             }
         } else if let Some(instruction) = line.strip_prefix('+') {
@@ -324,6 +501,7 @@ fn parse_league(path: &Path, text: &str) -> LeagueFile {
                 .push(format!("{}: nessuna squadra", division.name));
         }
     }
+    league.division_sources = (0..league.divisions.len()).map(Some).collect();
     league
 }
 
@@ -337,6 +515,68 @@ fn split_instruction(instruction: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_across_divisions_swaps_boundary_clubs_and_preserves_counts() {
+        let mut league = parse_league(
+            Path::new("Test.txt"),
+            "! Country \"Test\"\n: A\n+ division 1\nA1\nA2\nA3\n: B\n+ division 2\nB1\nB2\nB3\n",
+        );
+        assert_eq!(league.move_club(1, 0, true), Some((0, 2)));
+        assert_eq!(league.divisions[0].teams, ["A1", "A2", "B1"]);
+        assert_eq!(league.divisions[1].teams, ["A3", "B2", "B3"]);
+        assert_eq!(league.move_club(0, 2, false), Some((1, 0)));
+        assert_eq!(league.divisions[0].teams, ["A1", "A2", "A3"]);
+        assert_eq!(league.move_club(0, 0, true), None);
+        assert_eq!(league.move_club(1, 2, false), None);
+        assert!(league.swap_clubs((0, 0), (1, 2)));
+        assert_eq!(league.divisions[0].teams[0], "B3");
+        assert_eq!(league.divisions[1].teams[2], "A1");
+        assert!(!league.swap_clubs((99, 0), (0, 0)));
+    }
+
+    #[test]
+    fn international_club_matches_all_divisions_without_guessing() {
+        let league = parse_league(
+            Path::new("Test.txt"),
+            "! Country \"Test\"\n: First\n+ division 1\nAlpha\nDuplicate\n: Second\n+ division 2\nBeta\nDuplicate\n",
+        );
+        assert_eq!(league.club_locations("Beta"), vec![(1, 0)]);
+        assert_eq!(league.club_locations("Missing"), vec![]);
+        assert_eq!(league.club_locations("Duplicate"), vec![(0, 1), (1, 1)]);
+        assert_eq!(league.club_locations("Alph"), vec![]);
+        assert_eq!(league.club_locations("alpha"), vec![]);
+    }
+
+    #[test]
+    fn division_edit_validates_and_preserves_other_divisions_and_team_order() {
+        let mut league = parse_league(
+            Path::new("Test.txt"),
+            "! Country \"Test\"\n: First\n+ division 1\n+ promotions 0\n+ relegations 1\n+ reputation 10\nZulu\nAlpha\nBeta\n: Second\n+ division 2\n+ promotions 1\n+ relegations 0\n+ reputation 5\nOther\n",
+        );
+        let original = league.divisions.clone();
+        league.divisions[0].name = "New name".into();
+        league.divisions[0].reputation = Some(12);
+        assert!(league.division_issues(0).is_empty());
+        assert_eq!(league.divisions[0].teams, original[0].teams);
+        assert_eq!(league.divisions[1], original[1]);
+        league.divisions[0].level = Some(2);
+        assert!(
+            league
+                .division_issues(0)
+                .iter()
+                .any(|message| message.contains("occupato"))
+        );
+        league.divisions[0].name.clear();
+        assert!(
+            league
+                .division_issues(0)
+                .iter()
+                .any(|message| message.contains("Nome"))
+        );
+        league.divisions = original.clone();
+        assert_eq!(league.divisions, original);
+    }
 
     #[test]
     fn preserves_order_and_separates_cup_properties() {
@@ -456,12 +696,15 @@ mod tests {
             .iter()
             .find(|country| country.name == "Italy")
             .unwrap();
-        assert_eq!(italy.clubs[0], "AC Milun");
+        assert_eq!(italy.clubs[0], "Inter");
         let domestic = world
             .leagues
             .iter()
             .find(|league| league.country == "Italy")
             .unwrap();
         assert_eq!(domestic.divisions[0].teams[0], "Inter");
+        for (position, club) in italy.clubs.iter().enumerate() {
+            assert_eq!(domestic.club_locations(club), vec![(0, position)]);
+        }
     }
 }
